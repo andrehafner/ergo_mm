@@ -690,7 +690,7 @@ sub render_login_page {
 }
 
 sub render_dashboard {
-    my ($dbh, $tab) = @_;
+    my ($dbh, $tab, $saved) = @_;
     $tab ||= 'overview';
 
     my $prices = get_latest_prices($dbh);
@@ -748,7 +748,7 @@ sub render_dashboard {
     } elsif ($tab eq 'alerts') {
         render_alerts_tab($alerts);
     } elsif ($tab eq 'settings') {
-        render_settings_tab($config);
+        render_settings_tab($config, $saved);
     }
 
     print qq{</div>};
@@ -1399,7 +1399,12 @@ sub render_alerts_tab {
 }
 
 sub render_settings_tab {
-    my ($config) = @_;
+    my ($config, $saved) = @_;
+
+    my $saved_msg = '';
+    if ($saved) {
+        $saved_msg = '<div style="background: rgba(34,197,94,0.2); border: 1px solid #22c55e; color: #22c55e; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px;">Settings saved successfully!</div>';
+    }
 
     print qq{
         <div class="dashboard-grid">
@@ -1408,7 +1413,10 @@ sub render_settings_tab {
                     <div class="card-title">Dashboard Settings</div>
                 </div>
                 <div class="card-body">
-                    <form method="POST" action="?tab=settings&action=save">
+                    $saved_msg
+                    <form method="POST">
+                        <input type="hidden" name="action" value="save">
+                        <input type="hidden" name="tab" value="settings">
                         <div class="settings-grid">
                             <div class="setting-group">
                                 <h3>Discord Notifications</h3>
@@ -1585,7 +1593,8 @@ sub main {
     }
 
     my $tab = $q->param('tab') || 'overview';
-    render_dashboard($dbh, $tab);
+    my $saved = $q->param('saved') || 0;
+    render_dashboard($dbh, $tab, $saved);
 
     $dbh->disconnect();
 }
