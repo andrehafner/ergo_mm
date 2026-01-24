@@ -631,7 +631,7 @@ sub process_kucoin {
         volume_24h_usd           => $ticker->{volValue} + 0,
         high_24h                 => $ticker->{high} + 0,
         low_24h                  => $ticker->{low} + 0,
-        price_change_24h         => ($ticker->{last} - $ticker->{open}) + 0,
+        price_change_24h         => ($ticker->{changePrice} || 0) + 0,
         price_change_percent_24h => $ticker->{changeRate} ? ($ticker->{changeRate} * 100) : 0,
     };
 
