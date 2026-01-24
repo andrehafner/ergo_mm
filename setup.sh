@@ -100,32 +100,22 @@ mysql -u root -p"$MYSQL_PASS" < "$SCRIPT_DIR/sql/schema.sql"
 echo -e "${GREEN}[OK]${NC} Database 'ergo_mm' created with all tables"
 
 echo ""
-echo "Step 3: Setting up CGI scripts"
+echo "Step 3: Setting up Perl scripts"
 echo "----------------------------------------------"
 
 # Make scripts executable
-chmod +x "$SCRIPT_DIR/cgi-bin/"*.pl
+chmod +x "$SCRIPT_DIR/"*.pl
 echo -e "${GREEN}[OK]${NC} Scripts made executable"
 
-# Check if Apache CGI directory exists
-CGI_DIR="/usr/lib/cgi-bin"
-if [ -d "$CGI_DIR" ]; then
-    echo "Copying scripts to $CGI_DIR..."
-    sudo cp "$SCRIPT_DIR/cgi-bin/"*.pl "$CGI_DIR/"
-    sudo chown www-data:www-data "$CGI_DIR/"*.pl 2>/dev/null || true
-    sudo chmod 755 "$CGI_DIR/"*.pl
-    echo -e "${GREEN}[OK]${NC} Scripts copied to CGI directory"
-else
-    echo -e "${YELLOW}[WARN]${NC} CGI directory not found at $CGI_DIR"
-    echo "You'll need to manually copy the scripts to your web server's CGI directory."
-fi
+# Note: Scripts are now in the main folder, not cgi-bin
+echo -e "${GREEN}[OK]${NC} Scripts are located in: $SCRIPT_DIR"
 
 echo ""
 echo "Step 4: Setting up cron job"
 echo "----------------------------------------------"
 
-# Create cron entry
-CRON_ENTRY="*/5 * * * * /usr/bin/perl $CGI_DIR/monitor.pl >> /var/log/ergo_mm_monitor.log 2>&1"
+# Create cron entry - now pointing to scripts in main directory
+CRON_ENTRY="*/5 * * * * /usr/bin/perl $SCRIPT_DIR/monitor.pl >> /var/log/ergo_mm_monitor.log 2>&1"
 
 echo "Suggested cron entry (runs every 5 minutes):"
 echo "$CRON_ENTRY"
@@ -149,14 +139,14 @@ echo "=============================================="
 echo "Setup Complete!"
 echo "=============================================="
 echo ""
-echo "Dashboard URL: http://your-server/cgi-bin/dashboard.pl"
-echo "API URL: http://your-server/cgi-bin/api.pl"
+echo "Dashboard URL: https://my.ergoport.dev/cgi-bin/ergomm/dashboard.pl"
+echo "API URL: https://my.ergoport.dev/cgi-bin/ergomm/api.pl"
 echo "Password: ergo_IS_FOR_anyone"
 echo ""
 echo "Next steps:"
-echo "1. Configure your Discord webhook in the dashboard settings"
-echo "2. Adjust alert thresholds as needed"
-echo "3. Run the monitor manually to test: perl $CGI_DIR/monitor.pl"
+echo "1. Discord webhook is pre-configured in the database"
+echo "2. Adjust alert thresholds in the dashboard settings if needed"
+echo "3. Run the monitor manually to test: perl $SCRIPT_DIR/monitor.pl"
 echo "4. Check the log: tail -f /var/log/ergo_mm_monitor.log"
 echo ""
 echo "API Endpoints:"
