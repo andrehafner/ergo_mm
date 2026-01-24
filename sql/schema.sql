@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS trades (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     exchange VARCHAR(20) NOT NULL,
     symbol VARCHAR(20) NOT NULL DEFAULT 'ERG/USDT',
-    trade_id VARCHAR(50),
+    trade_id VARCHAR(100),
     price DECIMAL(20, 8) NOT NULL,
     amount DECIMAL(20, 8) NOT NULL,
     amount_usd DECIMAL(20, 2),
