@@ -989,7 +989,7 @@ sub html_footer {
 sub render_login_page {
     my ($error) = @_;
 
-    print "Content-type: text/html\\n\\n";
+    print "Content-type: text/html\n\n";
     print html_header('ERGO MM Dashboard - Login');
 
     my $error_html = '';
@@ -1027,7 +1027,7 @@ sub render_dashboard {
     my $alerts = get_recent_alerts($dbh, 20);
     my $config = get_config($dbh);
 
-    print "Content-type: text/html\\n\\n";
+    print "Content-type: text/html\n\n";
     print html_header('ERGO MM Dashboard');
 
     print qq{

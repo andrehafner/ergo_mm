@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS config (
 
 -- Insert default configuration values
 INSERT INTO config (config_key, config_value, description) VALUES
-('discord_webhook', '', 'Discord webhook URL for alerts'),
+('discord_webhook', 'https://discord.com/api/webhooks/1464750010267598931/44YOlHSIo2nTTtmSRhRKp6SYdNSebd6jldnXQ8OTXraBCGGLqpOnN82i7ahJhJRaknJI', 'Discord webhook URL for alerts'),
 ('spread_warning_threshold', '1.5', 'Spread percentage to trigger warning'),
 ('spread_critical_threshold', '3.0', 'Spread percentage to trigger critical alert'),
 ('depth_warning_threshold', '5000', 'Minimum depth in USD before warning'),
