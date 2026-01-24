@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # ============================================================
-# ERGO Market Maker Dashboard
+# ERGO Market Maker Dashboard - Enhanced Version
 # Web interface for monitoring ERG/USDT market making
 # ============================================================
 
@@ -58,7 +58,6 @@ sub validate_session {
     $sth->finish();
 
     if ($valid) {
-        # Update last activity
         $dbh->do("UPDATE sessions SET last_activity = NOW() WHERE session_id = ?", undef, $session_id);
     }
 
@@ -156,7 +155,8 @@ sub get_price_history {
             AVG(price) as price,
             AVG(spread_percent) as spread,
             MAX(high_24h) as high,
-            MIN(low_24h) as low
+            MIN(low_24h) as low,
+            AVG(volume_24h_usd) as volume
         FROM price_data
         WHERE exchange = ?
           AND timestamp > DATE_SUB(NOW(), INTERVAL ? HOUR)
@@ -187,6 +187,33 @@ sub get_depth_history {
           AND timestamp > DATE_SUB(NOW(), INTERVAL ? HOUR)
         GROUP BY time_bucket, depth_level
         ORDER BY time_bucket, depth_level
+    });
+    $sth->execute($exchange, $hours);
+    my @results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        push @results, $row;
+    }
+    $sth->finish();
+    return \@results;
+}
+
+sub get_trade_history {
+    my ($dbh, $exchange, $hours) = @_;
+    $hours ||= 24;
+
+    my $sth = $dbh->prepare(qq{
+        SELECT
+            DATE_FORMAT(recorded_at, '%Y-%m-%d %H:00') as time_bucket,
+            COUNT(*) as trade_count,
+            SUM(amount_usd) as total_volume,
+            SUM(CASE WHEN side = 'buy' THEN amount_usd ELSE 0 END) as buy_volume,
+            SUM(CASE WHEN side = 'sell' THEN amount_usd ELSE 0 END) as sell_volume,
+            AVG(price) as avg_price
+        FROM trades
+        WHERE exchange = ?
+          AND recorded_at > DATE_SUB(NOW(), INTERVAL ? HOUR)
+        GROUP BY time_bucket
+        ORDER BY time_bucket
     });
     $sth->execute($exchange, $hours);
     my @results;
@@ -255,8 +282,9 @@ sub html_header {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>$title</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght\@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
     <style>
         :root {
             --bg-primary: #1a1d23;
@@ -276,11 +304,7 @@ sub html_header {
             --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
         }
 
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -290,13 +314,8 @@ sub html_header {
             line-height: 1.5;
         }
 
-        .container {
-            max-width: 1600px;
-            margin: 0 auto;
-            padding: 20px;
-        }
+        .container { max-width: 1800px; margin: 0 auto; padding: 20px; }
 
-        /* Header */
         .header {
             background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
             border-bottom: 1px solid var(--border-color);
@@ -308,12 +327,6 @@ sub html_header {
             border-radius: 12px;
         }
 
-        .header-title {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
         .header-title h1 {
             font-size: 24px;
             font-weight: 700;
@@ -323,16 +336,9 @@ sub html_header {
             background-clip: text;
         }
 
-        .header-subtitle {
-            color: var(--text-secondary);
-            font-size: 14px;
-        }
+        .header-subtitle { color: var(--text-secondary); font-size: 14px; }
 
-        .header-actions {
-            display: flex;
-            gap: 12px;
-            align-items: center;
-        }
+        .header-actions { display: flex; gap: 12px; align-items: center; }
 
         .btn {
             padding: 8px 16px;
@@ -348,31 +354,11 @@ sub html_header {
             gap: 6px;
         }
 
-        .btn-primary {
-            background: var(--accent-cyan);
-            color: var(--bg-primary);
-        }
+        .btn-primary { background: var(--accent-cyan); color: var(--bg-primary); }
+        .btn-primary:hover { background: #00b894; }
+        .btn-secondary { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-color); }
+        .btn-secondary:hover { background: var(--bg-card); }
 
-        .btn-primary:hover {
-            background: #00b894;
-        }
-
-        .btn-secondary {
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-            border: 1px solid var(--border-color);
-        }
-
-        .btn-secondary:hover {
-            background: var(--bg-card);
-        }
-
-        .btn-danger {
-            background: var(--accent-red);
-            color: white;
-        }
-
-        /* Status Indicator */
         .status-indicator {
             display: flex;
             align-items: center;
@@ -390,20 +376,11 @@ sub html_header {
             animation: pulse 2s infinite;
         }
 
-        .status-dot.online {
-            background: var(--accent-green);
-        }
+        .status-dot.online { background: var(--accent-green); }
+        .status-dot.offline { background: var(--accent-red); }
 
-        .status-dot.offline {
-            background: var(--accent-red);
-        }
+        \@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-        \@keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-
-        /* Grid Layout */
         .dashboard-grid {
             display: grid;
             grid-template-columns: repeat(12, 1fr);
@@ -425,419 +402,71 @@ sub html_header {
             align-items: center;
         }
 
-        .card-title {
-            font-size: 16px;
-            font-weight: 600;
-            color: var(--text-primary);
-        }
+        .card-title { font-size: 16px; font-weight: 600; color: var(--text-primary); }
+        .card-badge { padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 500; background: var(--bg-tertiary); }
+        .card-body { padding: 20px; }
 
-        .card-badge {
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 500;
-        }
+        .exchange-card { grid-column: span 6; }
 
-        .card-body {
-            padding: 20px;
-        }
-
-        /* Exchange Cards */
-        .exchange-card {
-            grid-column: span 6;
-        }
-
-        .exchange-header {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 20px;
-        }
+        .exchange-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 
         .exchange-logo {
             width: 40px;
             height: 40px;
             border-radius: 10px;
-            background: var(--bg-tertiary);
             display: flex;
             align-items: center;
             justify-content: center;
             font-weight: 700;
-            font-size: 14px;
+            font-size: 12px;
+            color: white;
         }
 
-        .exchange-logo.kucoin {
-            background: linear-gradient(135deg, #24ae8f, #1a7a64);
-        }
+        .exchange-logo.kucoin { background: linear-gradient(135deg, #24ae8f, #1a7a64); }
+        .exchange-logo.mexc { background: linear-gradient(135deg, #1652f0, #0d3d9e); }
 
-        .exchange-logo.mexc {
-            background: linear-gradient(135deg, #1652f0, #0d3d9e);
-        }
+        .exchange-name { font-size: 18px; font-weight: 600; }
+        .exchange-pair { color: var(--text-secondary); font-size: 14px; }
 
-        .exchange-name {
-            font-size: 18px;
-            font-weight: 600;
-        }
-
-        .exchange-pair {
-            color: var(--text-secondary);
-            font-size: 14px;
-        }
-
-        /* Metrics Grid */
-        .metrics-grid {
+        .metrics-row {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 16px;
-            margin-bottom: 24px;
+            gap: 12px;
+            margin-bottom: 20px;
         }
 
         .metric-box {
             background: var(--bg-tertiary);
             border-radius: 10px;
-            padding: 16px;
+            padding: 14px;
             text-align: center;
         }
 
         .metric-label {
-            font-size: 12px;
+            font-size: 11px;
             color: var(--text-secondary);
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            margin-bottom: 8px;
-        }
-
-        .metric-value {
-            font-size: 24px;
-            font-weight: 700;
-            color: var(--text-primary);
-        }
-
-        .metric-value.positive {
-            color: var(--accent-green);
-        }
-
-        .metric-value.negative {
-            color: var(--accent-red);
-        }
-
-        .metric-value.warning {
-            color: var(--accent-orange);
-        }
-
-        .metric-change {
-            font-size: 12px;
-            margin-top: 4px;
-        }
-
-        /* Depth Table */
-        .depth-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        .depth-table th,
-        .depth-table td {
-            padding: 12px 16px;
-            text-align: right;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .depth-table th {
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .depth-table th:first-child,
-        .depth-table td:first-child {
-            text-align: left;
-        }
-
-        .depth-table tr:last-child td {
-            border-bottom: none;
-        }
-
-        .bid-value {
-            color: var(--accent-green);
-        }
-
-        .ask-value {
-            color: var(--accent-red);
-        }
-
-        /* Recommendations Panel */
-        .recommendations-card {
-            grid-column: span 12;
-        }
-
-        .recommendation-list {
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-
-        .recommendation-item {
-            display: flex;
-            align-items: flex-start;
-            gap: 16px;
-            padding: 16px;
-            background: var(--bg-tertiary);
-            border-radius: 10px;
-            border-left: 4px solid;
-        }
-
-        .recommendation-item.priority-high {
-            border-left-color: var(--accent-red);
-        }
-
-        .recommendation-item.priority-medium {
-            border-left-color: var(--accent-orange);
-        }
-
-        .recommendation-item.priority-low {
-            border-left-color: var(--accent-blue);
-        }
-
-        .recommendation-icon {
-            width: 40px;
-            height: 40px;
-            border-radius: 10px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 20px;
-            flex-shrink: 0;
-        }
-
-        .recommendation-content {
-            flex: 1;
-        }
-
-        .recommendation-action {
-            font-weight: 600;
-            font-size: 15px;
-            margin-bottom: 4px;
-        }
-
-        .recommendation-reason {
-            color: var(--text-secondary);
-            font-size: 14px;
-        }
-
-        .recommendation-meta {
-            display: flex;
-            gap: 16px;
-            margin-top: 8px;
-            font-size: 12px;
-            color: var(--text-muted);
-        }
-
-        /* Alerts Panel */
-        .alerts-card {
-            grid-column: span 6;
-        }
-
-        .alert-list {
-            max-height: 400px;
-            overflow-y: auto;
-        }
-
-        .alert-item {
-            display: flex;
-            align-items: flex-start;
-            gap: 12px;
-            padding: 14px;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .alert-item:last-child {
-            border-bottom: none;
-        }
-
-        .alert-severity {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            margin-top: 6px;
-            flex-shrink: 0;
-        }
-
-        .alert-severity.critical {
-            background: var(--accent-red);
-        }
-
-        .alert-severity.warning {
-            background: var(--accent-orange);
-        }
-
-        .alert-severity.info {
-            background: var(--accent-blue);
-        }
-
-        .alert-content {
-            flex: 1;
-        }
-
-        .alert-message {
-            font-size: 14px;
-            margin-bottom: 4px;
-        }
-
-        .alert-time {
-            font-size: 12px;
-            color: var(--text-muted);
-        }
-
-        /* Charts */
-        .chart-container {
-            position: relative;
-            height: 250px;
-        }
-
-        /* Settings Panel */
-        .settings-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 20px;
-        }
-
-        .setting-group {
-            background: var(--bg-tertiary);
-            border-radius: 10px;
-            padding: 20px;
-        }
-
-        .setting-group h3 {
-            font-size: 14px;
-            font-weight: 600;
-            margin-bottom: 16px;
-            color: var(--text-primary);
-        }
-
-        .setting-item {
-            margin-bottom: 16px;
-        }
-
-        .setting-item:last-child {
-            margin-bottom: 0;
-        }
-
-        .setting-label {
-            display: block;
-            font-size: 13px;
-            color: var(--text-secondary);
             margin-bottom: 6px;
         }
 
-        .setting-input {
-            width: 100%;
-            padding: 10px 14px;
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            background: var(--bg-secondary);
-            color: var(--text-primary);
-            font-size: 14px;
-        }
+        .metric-value { font-size: 20px; font-weight: 700; color: var(--text-primary); }
+        .metric-value.positive { color: var(--accent-green); }
+        .metric-value.negative { color: var(--accent-red); }
+        .metric-value.warning { color: var(--accent-orange); }
+        .metric-change { font-size: 11px; margin-top: 4px; color: var(--text-secondary); }
 
-        .setting-input:focus {
-            outline: none;
-            border-color: var(--accent-cyan);
-        }
+        .chart-container { position: relative; height: 200px; margin-bottom: 16px; }
+        .chart-container.tall { height: 280px; }
 
-        .setting-description {
-            font-size: 11px;
-            color: var(--text-muted);
-            margin-top: 4px;
-        }
+        .depth-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .depth-table th, .depth-table td { padding: 10px 12px; text-align: right; border-bottom: 1px solid var(--border-color); }
+        .depth-table th { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; }
+        .depth-table th:first-child, .depth-table td:first-child { text-align: left; }
+        .depth-table tr:last-child td { border-bottom: none; }
+        .bid-value { color: var(--accent-green); }
+        .ask-value { color: var(--accent-red); }
 
-        /* Login Form */
-        .login-container {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            background: var(--bg-primary);
-        }
-
-        .login-box {
-            background: var(--bg-card);
-            border-radius: 16px;
-            padding: 40px;
-            width: 100%;
-            max-width: 400px;
-            border: 1px solid var(--border-color);
-            box-shadow: var(--shadow);
-        }
-
-        .login-title {
-            text-align: center;
-            margin-bottom: 32px;
-        }
-
-        .login-title h1 {
-            font-size: 28px;
-            font-weight: 700;
-            margin-bottom: 8px;
-            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .login-title p {
-            color: var(--text-secondary);
-            font-size: 14px;
-        }
-
-        .login-form input {
-            width: 100%;
-            padding: 14px 18px;
-            border-radius: 10px;
-            border: 1px solid var(--border-color);
-            background: var(--bg-secondary);
-            color: var(--text-primary);
-            font-size: 16px;
-            margin-bottom: 20px;
-        }
-
-        .login-form input:focus {
-            outline: none;
-            border-color: var(--accent-cyan);
-        }
-
-        .login-form button {
-            width: 100%;
-            padding: 14px;
-            border-radius: 10px;
-            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue));
-            color: var(--bg-primary);
-            font-size: 16px;
-            font-weight: 600;
-            border: none;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-
-        .login-form button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0, 212, 170, 0.3);
-        }
-
-        .login-error {
-            background: rgba(239, 68, 68, 0.1);
-            border: 1px solid var(--accent-red);
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 20px;
-            color: var(--accent-red);
-            font-size: 14px;
-            text-align: center;
-        }
-
-        /* Tabs */
         .tabs {
             display: flex;
             gap: 4px;
@@ -858,111 +487,165 @@ sub html_header {
             text-decoration: none;
         }
 
-        .tab:hover {
-            color: var(--text-primary);
+        .tab:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+        .tab.active { background: var(--accent-cyan); color: var(--bg-primary); }
+
+        .full-width { grid-column: span 12; }
+        .half-width { grid-column: span 6; }
+        .third-width { grid-column: span 4; }
+
+        .alert-list { max-height: 400px; overflow-y: auto; }
+
+        .alert-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 12px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .alert-item:last-child { border-bottom: none; }
+
+        .alert-severity {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-top: 5px;
+            flex-shrink: 0;
+        }
+
+        .alert-severity.critical { background: var(--accent-red); }
+        .alert-severity.warning { background: var(--accent-orange); }
+        .alert-severity.info { background: var(--accent-blue); }
+
+        .alert-message { font-size: 13px; margin-bottom: 4px; }
+        .alert-time { font-size: 11px; color: var(--text-muted); }
+
+        .recommendation-list { display: flex; flex-direction: column; gap: 10px; }
+
+        .recommendation-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 14px;
             background: var(--bg-tertiary);
+            border-radius: 10px;
+            border-left: 4px solid;
         }
 
-        .tab.active {
-            background: var(--accent-cyan);
+        .recommendation-item.priority-high { border-left-color: var(--accent-red); }
+        .recommendation-item.priority-medium { border-left-color: var(--accent-orange); }
+        .recommendation-item.priority-low { border-left-color: var(--accent-blue); }
+
+        .recommendation-icon { font-size: 20px; }
+        .recommendation-action { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+        .recommendation-reason { color: var(--text-secondary); font-size: 13px; }
+        .recommendation-meta { display: flex; gap: 16px; margin-top: 6px; font-size: 11px; color: var(--text-muted); }
+
+        .empty-state { text-align: center; padding: 40px 20px; color: var(--text-secondary); }
+        .empty-state-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.5; }
+
+        .settings-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+        .setting-group { background: var(--bg-tertiary); border-radius: 10px; padding: 20px; }
+        .setting-group h3 { font-size: 14px; font-weight: 600; margin-bottom: 16px; }
+        .setting-item { margin-bottom: 14px; }
+        .setting-item:last-child { margin-bottom: 0; }
+        .setting-label { display: block; font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; }
+        .setting-input {
+            width: 100%;
+            padding: 10px 14px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 14px;
+        }
+        .setting-input:focus { outline: none; border-color: var(--accent-cyan); }
+        .setting-description { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+        .login-container { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .login-box {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 40px;
+            width: 100%;
+            max-width: 400px;
+            border: 1px solid var(--border-color);
+        }
+        .login-title { text-align: center; margin-bottom: 32px; }
+        .login-title h1 {
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .login-title p { color: var(--text-secondary); font-size: 14px; }
+        .login-form input {
+            width: 100%;
+            padding: 14px 18px;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 16px;
+            margin-bottom: 20px;
+        }
+        .login-form input:focus { outline: none; border-color: var(--accent-cyan); }
+        .login-form button {
+            width: 100%;
+            padding: 14px;
+            border-radius: 10px;
+            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue));
             color: var(--bg-primary);
+            font-size: 16px;
+            font-weight: 600;
+            border: none;
+            cursor: pointer;
+        }
+        .login-error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid var(--accent-red);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 20px;
+            color: var(--accent-red);
+            font-size: 14px;
+            text-align: center;
         }
 
-        /* Responsive */
-        \@media (max-width: 1200px) {
-            .exchange-card {
-                grid-column: span 12;
-            }
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-top: 16px;
+        }
 
-            .metrics-grid {
-                grid-template-columns: repeat(2, 1fr);
-            }
+        .stat-box {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 12px;
+            text-align: center;
+        }
+
+        .stat-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 4px; }
+        .stat-value { font-size: 16px; font-weight: 600; }
+
+        \@media (max-width: 1200px) {
+            .exchange-card, .half-width { grid-column: span 12; }
+            .third-width { grid-column: span 6; }
         }
 
         \@media (max-width: 768px) {
-            .container {
-                padding: 12px;
-            }
-
-            .header {
-                flex-direction: column;
-                gap: 16px;
-                text-align: center;
-            }
-
-            .metrics-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .settings-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .alerts-card {
-                grid-column: span 12;
-            }
+            .metrics-row { grid-template-columns: repeat(2, 1fr); }
+            .third-width { grid-column: span 12; }
+            .settings-grid { grid-template-columns: 1fr; }
         }
 
-        /* Scrollbar */
-        ::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
-        }
-
-        ::-webkit-scrollbar-track {
-            background: var(--bg-secondary);
-        }
-
-        ::-webkit-scrollbar-thumb {
-            background: var(--border-color);
-            border-radius: 4px;
-        }
-
-        ::-webkit-scrollbar-thumb:hover {
-            background: var(--text-muted);
-        }
-
-        /* Empty State */
-        .empty-state {
-            text-align: center;
-            padding: 40px 20px;
-            color: var(--text-secondary);
-        }
-
-        .empty-state-icon {
-            font-size: 48px;
-            margin-bottom: 16px;
-            opacity: 0.5;
-        }
-
-        /* Tooltip */
-        .tooltip {
-            position: relative;
-            cursor: help;
-        }
-
-        .tooltip::after {
-            content: attr(data-tooltip);
-            position: absolute;
-            bottom: 100%;
-            left: 50%;
-            transform: translateX(-50%);
-            padding: 6px 10px;
-            background: var(--bg-primary);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            font-size: 12px;
-            white-space: nowrap;
-            opacity: 0;
-            visibility: hidden;
-            transition: all 0.2s;
-            z-index: 100;
-        }
-
-        .tooltip:hover::after {
-            opacity: 1;
-            visibility: visible;
-        }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-secondary); }
+        ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
     </style>
 </head>
 <body>
@@ -971,16 +654,6 @@ sub html_header {
 
 sub html_footer {
     return qq{
-    <script>
-        // Auto-refresh every 60 seconds
-        setTimeout(function() {
-            location.reload();
-        }, 60000);
-
-        // Chart configuration
-        Chart.defaults.color = '#9aa0a6';
-        Chart.defaults.borderColor = '#374151';
-    </script>
 </body>
 </html>
 };
@@ -1027,12 +700,22 @@ sub render_dashboard {
     my $alerts = get_recent_alerts($dbh, 20);
     my $config = get_config($dbh);
 
+    # Get chart data for each exchange
+    my %chart_data;
+    foreach my $exchange ('MEXC', 'KUCOIN') {
+        $chart_data{$exchange} = {
+            price_history => get_price_history($dbh, $exchange, 48),
+            depth_history => get_depth_history($dbh, $exchange, 48),
+            trade_history => get_trade_history($dbh, $exchange, 48),
+            trade_summary => get_trade_summary($dbh, $exchange, 24),
+        };
+    }
+
     print "Content-type: text/html\n\n";
     print html_header('ERGO MM Dashboard');
 
     print qq{
     <div class="container">
-        <!-- Header -->
         <div class="header">
             <div class="header-title">
                 <div>
@@ -1050,31 +733,30 @@ sub render_dashboard {
             </div>
         </div>
 
-        <!-- Navigation Tabs -->
         <div class="tabs">
             <a href="?tab=overview" class="tab } . ($tab eq 'overview' ? 'active' : '') . qq{">Overview</a>
+            <a href="?tab=charts" class="tab } . ($tab eq 'charts' ? 'active' : '') . qq{">Charts</a>
             <a href="?tab=alerts" class="tab } . ($tab eq 'alerts' ? 'active' : '') . qq{">Alerts</a>
             <a href="?tab=settings" class="tab } . ($tab eq 'settings' ? 'active' : '') . qq{">Settings</a>
         </div>
     };
 
     if ($tab eq 'overview') {
-        render_overview_tab($prices, $depth, $metrics, $recommendations, $alerts);
+        render_overview_tab($dbh, $prices, $depth, $metrics, $recommendations, $alerts, \%chart_data);
+    } elsif ($tab eq 'charts') {
+        render_charts_tab($dbh, \%chart_data, $config);
     } elsif ($tab eq 'alerts') {
         render_alerts_tab($alerts);
     } elsif ($tab eq 'settings') {
         render_settings_tab($config);
     }
 
-    print qq{
-    </div>
-    };
-
+    print qq{</div>};
     print html_footer();
 }
 
 sub render_overview_tab {
-    my ($prices, $depth, $metrics, $recommendations, $alerts) = @_;
+    my ($dbh, $prices, $depth, $metrics, $recommendations, $alerts, $chart_data) = @_;
 
     print qq{<div class="dashboard-grid">};
 
@@ -1084,16 +766,61 @@ sub render_overview_tab {
         my $exchange_lower = lc($exchange);
         my $exchange_depth = $depth->{$exchange} || {};
         my $exchange_metrics = $metrics->{$exchange} || {};
+        my $exchange_charts = $chart_data->{$exchange} || {};
+        my $trade_summary = $exchange_charts->{trade_summary} || {};
 
         my $spread_class = '';
-        if ($exchange_data->{spread_percent} >= 3) {
+        if (($exchange_data->{spread_percent} || 0) >= 3) {
             $spread_class = 'negative';
-        } elsif ($exchange_data->{spread_percent} >= 1.5) {
+        } elsif (($exchange_data->{spread_percent} || 0) >= 1.5) {
             $spread_class = 'warning';
         }
 
-        my $change_class = $exchange_data->{price_change_percent_24h} >= 0 ? 'positive' : 'negative';
-        my $change_sign = $exchange_data->{price_change_percent_24h} >= 0 ? '+' : '';
+        my $change_pct = $exchange_data->{price_change_percent_24h} || 0;
+        my $change_class = $change_pct >= 0 ? 'positive' : 'negative';
+        my $change_sign = $change_pct >= 0 ? '+' : '';
+
+        # Prepare price chart data
+        my $price_history = $exchange_charts->{price_history} || [];
+        my @price_labels = map { $_->{time_bucket} } @$price_history;
+        my @price_values = map { $_->{price} || 0 } @$price_history;
+        my @spread_values = map { $_->{spread} || 0 } @$price_history;
+
+        my $price_labels_json = encode_json(\@price_labels);
+        my $price_values_json = encode_json(\@price_values);
+        my $spread_values_json = encode_json(\@spread_values);
+
+        # Prepare depth chart data
+        my $depth_history = $exchange_charts->{depth_history} || [];
+        my %depth_by_time;
+        foreach my $d (@$depth_history) {
+            my $time = $d->{time_bucket};
+            my $level = $d->{depth_level};
+            $depth_by_time{$time}{$level}{bid} = $d->{bid_depth} || 0;
+            $depth_by_time{$time}{$level}{ask} = $d->{ask_depth} || 0;
+        }
+
+        my @depth_times = sort keys %depth_by_time;
+        my @bid_2pct = map { $depth_by_time{$_}{'2%'}{bid} || 0 } @depth_times;
+        my @bid_5pct = map { $depth_by_time{$_}{'5%'}{bid} || 0 } @depth_times;
+        my @ask_2pct = map { $depth_by_time{$_}{'2%'}{ask} || 0 } @depth_times;
+        my @ask_5pct = map { $depth_by_time{$_}{'5%'}{ask} || 0 } @depth_times;
+
+        my $depth_labels_json = encode_json(\@depth_times);
+        my $bid_2pct_json = encode_json(\@bid_2pct);
+        my $bid_5pct_json = encode_json(\@bid_5pct);
+        my $ask_2pct_json = encode_json(\@ask_2pct);
+        my $ask_5pct_json = encode_json(\@ask_5pct);
+
+        # Prepare trade chart data
+        my $trade_history = $exchange_charts->{trade_history} || [];
+        my @trade_labels = map { $_->{time_bucket} } @$trade_history;
+        my @buy_volumes = map { $_->{buy_volume} || 0 } @$trade_history;
+        my @sell_volumes = map { $_->{sell_volume} || 0 } @$trade_history;
+
+        my $trade_labels_json = encode_json(\@trade_labels);
+        my $buy_volumes_json = encode_json(\@buy_volumes);
+        my $sell_volumes_json = encode_json(\@sell_volumes);
 
         print qq{
         <div class="card exchange-card">
@@ -1106,15 +833,15 @@ sub render_overview_tab {
                     </div>
                 </div>
 
-                <div class="metrics-grid">
+                <div class="metrics-row">
                     <div class="metric-box">
                         <div class="metric-label">Price</div>
-                        <div class="metric-value">\$} . sprintf("%.4f", $exchange_data->{price}) . qq{</div>
-                        <div class="metric-change $change_class">$change_sign} . sprintf("%.2f", $exchange_data->{price_change_percent_24h}) . qq{%</div>
+                        <div class="metric-value">\$} . sprintf("%.4f", $exchange_data->{price} || 0) . qq{</div>
+                        <div class="metric-change $change_class">$change_sign} . sprintf("%.2f", $change_pct) . qq{%</div>
                     </div>
                     <div class="metric-box">
                         <div class="metric-label">Spread</div>
-                        <div class="metric-value $spread_class">} . sprintf("%.2f", $exchange_data->{spread_percent}) . qq{%</div>
+                        <div class="metric-value $spread_class">} . sprintf("%.2f", $exchange_data->{spread_percent} || 0) . qq{%</div>
                     </div>
                     <div class="metric-box">
                         <div class="metric-label">24h Volume</div>
@@ -1126,12 +853,23 @@ sub render_overview_tab {
                     </div>
                 </div>
 
+                <!-- Price History Chart -->
+                <div class="chart-container">
+                    <canvas id="priceChart_$exchange_lower"></canvas>
+                </div>
+
+                <!-- Spread Chart -->
+                <div class="chart-container">
+                    <canvas id="spreadChart_$exchange_lower"></canvas>
+                </div>
+
+                <!-- Depth Table -->
                 <table class="depth-table">
                     <thead>
                         <tr>
-                            <th>Depth Level</th>
-                            <th>Bid Depth</th>
-                            <th>Ask Depth</th>
+                            <th>Depth</th>
+                            <th>Bid</th>
+                            <th>Ask</th>
                             <th>Total</th>
                         </tr>
                     </thead>
@@ -1154,22 +892,124 @@ sub render_overview_tab {
             };
         }
 
+        my $buy_vol = $trade_summary->{buy_volume} || 0;
+        my $sell_vol = $trade_summary->{sell_volume} || 0;
+        my $total_vol = $buy_vol + $sell_vol;
+        my $buy_ratio = $total_vol > 0 ? ($buy_vol / $total_vol * 100) : 50;
+
         print qq{
                     </tbody>
                 </table>
+
+                <div class="stats-row">
+                    <div class="stat-box">
+                        <div class="stat-label">24h Trades</div>
+                        <div class="stat-value">} . ($trade_summary->{trade_count} || 0) . qq{</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Buy Vol</div>
+                        <div class="stat-value bid-value">\$} . format_number($buy_vol) . qq{</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Sell Vol</div>
+                        <div class="stat-value ask-value">\$} . format_number($sell_vol) . qq{</div>
+                    </div>
+                </div>
             </div>
         </div>
+
+        <script>
+        (function() {
+            // Price Chart
+            const priceCtx_$exchange_lower = document.getElementById('priceChart_$exchange_lower').getContext('2d');
+            new Chart(priceCtx_$exchange_lower, {
+                type: 'line',
+                data: {
+                    labels: $price_labels_json,
+                    datasets: [{
+                        label: 'Price',
+                        data: $price_values_json,
+                        borderColor: '#00d4aa',
+                        backgroundColor: 'rgba(0, 212, 170, 0.1)',
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 0,
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        title: { display: true, text: 'Price History', color: '#9aa0a6', font: { size: 12 } }
+                    },
+                    scales: {
+                        x: { display: false },
+                        y: {
+                            grid: { color: '#374151' },
+                            ticks: { color: '#9aa0a6', callback: v => '\$' + v.toFixed(4) }
+                        }
+                    }
+                }
+            });
+
+            // Spread Chart
+            const spreadCtx_$exchange_lower = document.getElementById('spreadChart_$exchange_lower').getContext('2d');
+            new Chart(spreadCtx_$exchange_lower, {
+                type: 'line',
+                data: {
+                    labels: $price_labels_json,
+                    datasets: [{
+                        label: 'Spread %',
+                        data: $spread_values_json,
+                        borderColor: '#8b5cf6',
+                        backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 0,
+                        borderWidth: 2
+                    }, {
+                        label: 'Warning (1%)',
+                        data: Array($spread_values_json.length).fill(1),
+                        borderColor: '#f59e0b',
+                        borderDash: [5, 5],
+                        borderWidth: 1,
+                        pointRadius: 0,
+                        fill: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        title: { display: true, text: 'Spread %', color: '#9aa0a6', font: { size: 12 } }
+                    },
+                    scales: {
+                        x: { display: false },
+                        y: {
+                            grid: { color: '#374151' },
+                            ticks: { color: '#9aa0a6', callback: v => v.toFixed(2) + '%' },
+                            min: 0
+                        }
+                    }
+                }
+            });
+        })();
+        </script>
         };
     }
 
-    # If no exchange data
+    # Show message if no exchange data
     unless (@$prices) {
         print qq{
         <div class="card exchange-card">
             <div class="card-body">
                 <div class="empty-state">
                     <div class="empty-state-icon">📊</div>
-                    <p>No market data available yet. Run the monitor script to collect data.</p>
+                    <p>No market data available yet. Run the monitor script to collect data:</p>
+                    <p style="margin-top: 10px; font-family: monospace; background: var(--bg-tertiary); padding: 10px; border-radius: 6px;">perl monitor.pl</p>
                 </div>
             </div>
         </div>
@@ -1178,10 +1018,10 @@ sub render_overview_tab {
 
     # Recommendations Card
     print qq{
-        <div class="card recommendations-card">
+        <div class="card full-width">
             <div class="card-header">
                 <div class="card-title">Trading Recommendations</div>
-                <span class="card-badge" style="background: var(--bg-tertiary);">} . scalar(@$recommendations) . qq{ Active</span>
+                <span class="card-badge">} . scalar(@$recommendations) . qq{ Active</span>
             </div>
             <div class="card-body">
     };
@@ -1191,28 +1031,19 @@ sub render_overview_tab {
         foreach my $rec (@$recommendations) {
             my $priority_class = $rec->{priority} >= 8 ? 'priority-high' :
                                  $rec->{priority} >= 5 ? 'priority-medium' : 'priority-low';
-
-            my $icon = '💡';
-            if ($rec->{action} eq 'PULL_LIQUIDITY') {
-                $icon = '⚠️';
-            } elsif ($rec->{action} eq 'ADD_LIQUIDITY') {
-                $icon = '💰';
-            } elsif ($rec->{action} eq 'TIGHTEN_SPREAD') {
-                $icon = '📉';
-            } elsif ($rec->{action} eq 'REDUCE_EXPOSURE') {
-                $icon = '🛡️';
-            }
+            my $icon = $rec->{action} eq 'PULL_LIQUIDITY' ? '⚠️' :
+                       $rec->{action} eq 'ADD_LIQUIDITY' ? '💰' :
+                       $rec->{action} eq 'TIGHTEN_SPREAD' ? '📉' : '💡';
 
             print qq{
                 <div class="recommendation-item $priority_class">
                     <div class="recommendation-icon">$icon</div>
-                    <div class="recommendation-content">
+                    <div>
                         <div class="recommendation-action">$rec->{action}</div>
                         <div class="recommendation-reason">$rec->{reason}</div>
                         <div class="recommendation-meta">
                             <span>Exchange: } . ($rec->{exchange} || 'All') . qq{</span>
                             <span>Priority: $rec->{priority}/10</span>
-                            <span>Created: $rec->{created_at}</span>
                         </div>
                     </div>
                 </div>
@@ -1220,22 +1051,14 @@ sub render_overview_tab {
         }
         print qq{</div>};
     } else {
-        print qq{
-            <div class="empty-state">
-                <div class="empty-state-icon">✅</div>
-                <p>No active recommendations. Market conditions are within normal parameters.</p>
-            </div>
-        };
+        print qq{<div class="empty-state"><div class="empty-state-icon">✅</div><p>No active recommendations. Market conditions are within normal parameters.</p></div>};
     }
 
-    print qq{
-            </div>
-        </div>
-    };
+    print qq{</div></div>};
 
     # Recent Alerts Card
     print qq{
-        <div class="card alerts-card">
+        <div class="card half-width">
             <div class="card-header">
                 <div class="card-title">Recent Alerts (24h)</div>
             </div>
@@ -1244,11 +1067,12 @@ sub render_overview_tab {
     };
 
     if (@$alerts) {
-        foreach my $alert (splice(@$alerts, 0, 10)) {
+        foreach my $alert (@$alerts[0..9]) {
+            last unless $alert;
             print qq{
                     <div class="alert-item">
                         <div class="alert-severity $alert->{severity}"></div>
-                        <div class="alert-content">
+                        <div>
                             <div class="alert-message">$alert->{message}</div>
                             <div class="alert-time">$alert->{created_at}</div>
                         </div>
@@ -1256,22 +1080,14 @@ sub render_overview_tab {
             };
         }
     } else {
-        print qq{
-                    <div class="empty-state">
-                        <p>No alerts in the last 24 hours</p>
-                    </div>
-        };
+        print qq{<div class="empty-state"><p>No alerts in the last 24 hours</p></div>};
     }
 
-    print qq{
-                </div>
-            </div>
-        </div>
-    };
+    print qq{</div></div></div>};
 
-    # Trading Tips Card
+    # Tips Card
     print qq{
-        <div class="card alerts-card">
+        <div class="card half-width">
             <div class="card-header">
                 <div class="card-title">Market Making Tips</div>
             </div>
@@ -1279,30 +1095,16 @@ sub render_overview_tab {
                 <div class="recommendation-list">
                     <div class="recommendation-item priority-low">
                         <div class="recommendation-icon">📈</div>
-                        <div class="recommendation-content">
+                        <div>
                             <div class="recommendation-action">Watch for Volume Spikes</div>
-                            <div class="recommendation-reason">Large volume increases often precede price movements. Consider widening spreads during high volume periods to protect against adverse selection.</div>
-                        </div>
-                    </div>
-                    <div class="recommendation-item priority-low">
-                        <div class="recommendation-icon">⏰</div>
-                        <div class="recommendation-content">
-                            <div class="recommendation-action">Time Zone Awareness</div>
-                            <div class="recommendation-reason">Liquidity typically decreases during Asian trading hours (UTC+8). Consider reducing position sizes during low liquidity periods.</div>
+                            <div class="recommendation-reason">Large volume increases often precede price movements. Consider widening spreads during high volume.</div>
                         </div>
                     </div>
                     <div class="recommendation-item priority-low">
                         <div class="recommendation-icon">🔄</div>
-                        <div class="recommendation-content">
-                            <div class="recommendation-action">Cross-Exchange Arbitrage</div>
-                            <div class="recommendation-reason">Monitor price differences between KuCoin and MEXC. Consistent spreads >0.5% may indicate arbitrage opportunities or liquidity imbalances.</div>
-                        </div>
-                    </div>
-                    <div class="recommendation-item priority-low">
-                        <div class="recommendation-icon">🛡️</div>
-                        <div class="recommendation-content">
-                            <div class="recommendation-action">Inventory Management</div>
-                            <div class="recommendation-reason">Maintain balanced ERG/USDT ratios (ideally 50/50 by value). Skewed inventory increases directional risk.</div>
+                        <div>
+                            <div class="recommendation-action">Cross-Exchange Monitoring</div>
+                            <div class="recommendation-reason">Monitor price differences between KuCoin and MEXC. Consistent spreads >0.5% may indicate arbitrage opportunities.</div>
                         </div>
                     </div>
                 </div>
@@ -1313,12 +1115,258 @@ sub render_overview_tab {
     print qq{</div>};
 }
 
+sub render_charts_tab {
+    my ($dbh, $chart_data, $config) = @_;
+
+    print qq{<div class="dashboard-grid">};
+
+    foreach my $exchange ('MEXC', 'KUCOIN') {
+        my $exchange_lower = lc($exchange);
+        my $exchange_charts = $chart_data->{$exchange} || {};
+
+        # Prepare data
+        my $price_history = $exchange_charts->{price_history} || [];
+        my @price_labels = map { $_->{time_bucket} } @$price_history;
+        my @price_values = map { $_->{price} || 0 } @$price_history;
+        my @spread_values = map { $_->{spread} || 0 } @$price_history;
+
+        my $depth_history = $exchange_charts->{depth_history} || [];
+        my %depth_by_time;
+        foreach my $d (@$depth_history) {
+            my $time = $d->{time_bucket};
+            my $level = $d->{depth_level};
+            $depth_by_time{$time}{$level}{bid} = $d->{bid_depth} || 0;
+            $depth_by_time{$time}{$level}{ask} = $d->{ask_depth} || 0;
+        }
+        my @depth_times = sort keys %depth_by_time;
+        my @bid_2pct = map { $depth_by_time{$_}{'2%'}{bid} || 0 } @depth_times;
+        my @bid_5pct = map { $depth_by_time{$_}{'5%'}{bid} || 0 } @depth_times;
+        my @bid_10pct = map { $depth_by_time{$_}{'10%'}{bid} || 0 } @depth_times;
+        my @ask_2pct = map { $depth_by_time{$_}{'2%'}{ask} || 0 } @depth_times;
+        my @ask_5pct = map { $depth_by_time{$_}{'5%'}{ask} || 0 } @depth_times;
+        my @ask_10pct = map { $depth_by_time{$_}{'10%'}{ask} || 0 } @depth_times;
+
+        my $trade_history = $exchange_charts->{trade_history} || [];
+        my @trade_labels = map { $_->{time_bucket} } @$trade_history;
+        my @trade_counts = map { $_->{trade_count} || 0 } @$trade_history;
+        my @buy_volumes = map { $_->{buy_volume} || 0 } @$trade_history;
+        my @sell_volumes = map { $_->{sell_volume} || 0 } @$trade_history;
+
+        my $price_labels_json = encode_json(\@price_labels);
+        my $price_values_json = encode_json(\@price_values);
+        my $spread_values_json = encode_json(\@spread_values);
+        my $depth_labels_json = encode_json(\@depth_times);
+        my $bid_2pct_json = encode_json(\@bid_2pct);
+        my $bid_5pct_json = encode_json(\@bid_5pct);
+        my $bid_10pct_json = encode_json(\@bid_10pct);
+        my $ask_2pct_json = encode_json(\@ask_2pct);
+        my $ask_5pct_json = encode_json(\@ask_5pct);
+        my $ask_10pct_json = encode_json(\@ask_10pct);
+        my $trade_labels_json = encode_json(\@trade_labels);
+        my $trade_counts_json = encode_json(\@trade_counts);
+        my $buy_volumes_json = encode_json(\@buy_volumes);
+        my $sell_volumes_json = encode_json(\@sell_volumes);
+
+        print qq{
+        <div class="card full-width">
+            <div class="card-header">
+                <div class="card-title">$exchange - ERG/USDT Charts (48h)</div>
+            </div>
+            <div class="card-body">
+                <div class="dashboard-grid" style="gap: 16px;">
+                    <!-- Price History -->
+                    <div class="half-width">
+                        <div class="chart-container tall">
+                            <canvas id="priceChartFull_$exchange_lower"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Spread History -->
+                    <div class="half-width">
+                        <div class="chart-container tall">
+                            <canvas id="spreadChartFull_$exchange_lower"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Bid Depth History -->
+                    <div class="half-width">
+                        <div class="chart-container tall">
+                            <canvas id="bidDepthChart_$exchange_lower"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Ask Depth History -->
+                    <div class="half-width">
+                        <div class="chart-container tall">
+                            <canvas id="askDepthChart_$exchange_lower"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Trade Volume -->
+                    <div class="half-width">
+                        <div class="chart-container tall">
+                            <canvas id="volumeChart_$exchange_lower"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Trade Count -->
+                    <div class="half-width">
+                        <div class="chart-container tall">
+                            <canvas id="tradeCountChart_$exchange_lower"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        (function() {
+            const chartOptions = {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { labels: { color: '#9aa0a6', boxWidth: 12, font: { size: 11 } } } },
+                scales: {
+                    x: { grid: { color: '#374151' }, ticks: { color: '#9aa0a6', maxRotation: 0, maxTicksLimit: 8 } },
+                    y: { grid: { color: '#374151' }, ticks: { color: '#9aa0a6' } }
+                }
+            };
+
+            // Price Chart
+            new Chart(document.getElementById('priceChartFull_$exchange_lower'), {
+                type: 'line',
+                data: {
+                    labels: $price_labels_json,
+                    datasets: [{
+                        label: 'Price (\$)',
+                        data: $price_values_json,
+                        borderColor: '#00d4aa',
+                        backgroundColor: 'rgba(0, 212, 170, 0.1)',
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 0,
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    ...chartOptions,
+                    plugins: { ...chartOptions.plugins, title: { display: true, text: 'Price History', color: '#e8eaed' } },
+                    scales: { ...chartOptions.scales, y: { ...chartOptions.scales.y, ticks: { ...chartOptions.scales.y.ticks, callback: v => '\$' + v.toFixed(4) } } }
+                }
+            });
+
+            // Spread Chart
+            new Chart(document.getElementById('spreadChartFull_$exchange_lower'), {
+                type: 'line',
+                data: {
+                    labels: $price_labels_json,
+                    datasets: [{
+                        label: 'Spread %',
+                        data: $spread_values_json,
+                        borderColor: '#8b5cf6',
+                        backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 0,
+                        borderWidth: 2
+                    }, {
+                        label: 'Warning (1%)',
+                        data: Array($spread_values_json.length).fill(1),
+                        borderColor: '#f59e0b',
+                        borderDash: [5, 5],
+                        borderWidth: 1,
+                        pointRadius: 0
+                    }]
+                },
+                options: {
+                    ...chartOptions,
+                    plugins: { ...chartOptions.plugins, title: { display: true, text: 'Spread History', color: '#e8eaed' } },
+                    scales: { ...chartOptions.scales, y: { ...chartOptions.scales.y, min: 0, ticks: { ...chartOptions.scales.y.ticks, callback: v => v.toFixed(2) + '%' } } }
+                }
+            });
+
+            // Bid Depth Chart
+            new Chart(document.getElementById('bidDepthChart_$exchange_lower'), {
+                type: 'line',
+                data: {
+                    labels: $depth_labels_json,
+                    datasets: [
+                        { label: '2% Depth', data: $bid_2pct_json, borderColor: '#22c55e', backgroundColor: 'rgba(34, 197, 94, 0.1)', fill: true, tension: 0.3, pointRadius: 0 },
+                        { label: '5% Depth', data: $bid_5pct_json, borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.1)', fill: true, tension: 0.3, pointRadius: 0 },
+                        { label: '10% Depth', data: $bid_10pct_json, borderColor: '#8b5cf6', backgroundColor: 'rgba(139, 92, 246, 0.1)', fill: true, tension: 0.3, pointRadius: 0 }
+                    ]
+                },
+                options: {
+                    ...chartOptions,
+                    plugins: { ...chartOptions.plugins, title: { display: true, text: 'Bid Orderbook Depth', color: '#e8eaed' } },
+                    scales: { ...chartOptions.scales, y: { ...chartOptions.scales.y, ticks: { ...chartOptions.scales.y.ticks, callback: v => '\$' + (v/1000).toFixed(1) + 'k' } } }
+                }
+            });
+
+            // Ask Depth Chart
+            new Chart(document.getElementById('askDepthChart_$exchange_lower'), {
+                type: 'line',
+                data: {
+                    labels: $depth_labels_json,
+                    datasets: [
+                        { label: '2% Depth', data: $ask_2pct_json, borderColor: '#ef4444', backgroundColor: 'rgba(239, 68, 68, 0.1)', fill: true, tension: 0.3, pointRadius: 0 },
+                        { label: '5% Depth', data: $ask_5pct_json, borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.1)', fill: true, tension: 0.3, pointRadius: 0 },
+                        { label: '10% Depth', data: $ask_10pct_json, borderColor: '#ec4899', backgroundColor: 'rgba(236, 72, 153, 0.1)', fill: true, tension: 0.3, pointRadius: 0 }
+                    ]
+                },
+                options: {
+                    ...chartOptions,
+                    plugins: { ...chartOptions.plugins, title: { display: true, text: 'Ask Orderbook Depth', color: '#e8eaed' } },
+                    scales: { ...chartOptions.scales, y: { ...chartOptions.scales.y, ticks: { ...chartOptions.scales.y.ticks, callback: v => '\$' + (v/1000).toFixed(1) + 'k' } } }
+                }
+            });
+
+            // Volume Chart
+            new Chart(document.getElementById('volumeChart_$exchange_lower'), {
+                type: 'bar',
+                data: {
+                    labels: $trade_labels_json,
+                    datasets: [
+                        { label: 'Buy Volume', data: $buy_volumes_json, backgroundColor: 'rgba(34, 197, 94, 0.7)' },
+                        { label: 'Sell Volume', data: $sell_volumes_json, backgroundColor: 'rgba(239, 68, 68, 0.7)' }
+                    ]
+                },
+                options: {
+                    ...chartOptions,
+                    plugins: { ...chartOptions.plugins, title: { display: true, text: 'Trade Volume (Hourly)', color: '#e8eaed' } },
+                    scales: { ...chartOptions.scales, x: { ...chartOptions.scales.x, stacked: true }, y: { ...chartOptions.scales.y, stacked: true, ticks: { ...chartOptions.scales.y.ticks, callback: v => '\$' + v.toFixed(0) } } }
+                }
+            });
+
+            // Trade Count Chart
+            new Chart(document.getElementById('tradeCountChart_$exchange_lower'), {
+                type: 'bar',
+                data: {
+                    labels: $trade_labels_json,
+                    datasets: [{
+                        label: 'Trade Count',
+                        data: $trade_counts_json,
+                        backgroundColor: 'rgba(0, 212, 170, 0.7)'
+                    }]
+                },
+                options: {
+                    ...chartOptions,
+                    plugins: { ...chartOptions.plugins, title: { display: true, text: 'Filled Trades (Hourly)', color: '#e8eaed' } }
+                }
+            });
+        })();
+        </script>
+        };
+    }
+
+    print qq{</div>};
+}
+
 sub render_alerts_tab {
     my ($alerts) = @_;
 
     print qq{
         <div class="dashboard-grid">
-            <div class="card" style="grid-column: span 12;">
+            <div class="card full-width">
                 <div class="card-header">
                     <div class="card-title">Alert History (Last 24 Hours)</div>
                 </div>
@@ -1328,15 +1376,10 @@ sub render_alerts_tab {
     if (@$alerts) {
         print qq{<div class="alert-list" style="max-height: none;">};
         foreach my $alert (@$alerts) {
-            my $details = '';
-            if ($alert->{details} && $alert->{details} ne '{}') {
-                $details = $alert->{details};
-            }
-
             print qq{
                     <div class="alert-item">
                         <div class="alert-severity $alert->{severity}"></div>
-                        <div class="alert-content">
+                        <div>
                             <div class="alert-message"><strong>[$alert->{alert_type}]</strong> $alert->{message}</div>
                             <div class="alert-time">
                                 $alert->{created_at} |
@@ -1349,19 +1392,10 @@ sub render_alerts_tab {
         }
         print qq{</div>};
     } else {
-        print qq{
-            <div class="empty-state">
-                <div class="empty-state-icon">🔔</div>
-                <p>No alerts recorded in the last 24 hours.</p>
-            </div>
-        };
+        print qq{<div class="empty-state"><div class="empty-state-icon">🔔</div><p>No alerts recorded in the last 24 hours.</p></div>};
     }
 
-    print qq{
-                </div>
-            </div>
-        </div>
-    };
+    print qq{</div></div></div>};
 }
 
 sub render_settings_tab {
@@ -1369,7 +1403,7 @@ sub render_settings_tab {
 
     print qq{
         <div class="dashboard-grid">
-            <div class="card" style="grid-column: span 12;">
+            <div class="card full-width">
                 <div class="card-header">
                     <div class="card-title">Dashboard Settings</div>
                 </div>
@@ -1383,13 +1417,11 @@ sub render_settings_tab {
                                     <input type="text" name="discord_webhook" class="setting-input"
                                            value="} . ($config->{discord_webhook}{value} || '') . qq{"
                                            placeholder="https://discord.com/api/webhooks/...">
-                                    <div class="setting-description">Webhook URL for Discord alerts</div>
                                 </div>
                                 <div class="setting-item">
                                     <label class="setting-label">Alert Cooldown (minutes)</label>
                                     <input type="number" name="alert_cooldown_minutes" class="setting-input"
                                            value="} . ($config->{alert_cooldown_minutes}{value} || '30') . qq{">
-                                    <div class="setting-description">Minimum time between repeat alerts of same type</div>
                                 </div>
                             </div>
 
@@ -1399,13 +1431,11 @@ sub render_settings_tab {
                                     <label class="setting-label">Warning Threshold (%)</label>
                                     <input type="number" step="0.1" name="spread_warning_threshold" class="setting-input"
                                            value="} . ($config->{spread_warning_threshold}{value} || '1.5') . qq{">
-                                    <div class="setting-description">Spread % to trigger warning alert</div>
                                 </div>
                                 <div class="setting-item">
                                     <label class="setting-label">Critical Threshold (%)</label>
                                     <input type="number" step="0.1" name="spread_critical_threshold" class="setting-input"
                                            value="} . ($config->{spread_critical_threshold}{value} || '3.0') . qq{">
-                                    <div class="setting-description">Spread % to trigger critical alert</div>
                                 </div>
                             </div>
 
@@ -1415,13 +1445,36 @@ sub render_settings_tab {
                                     <label class="setting-label">Warning Threshold (USD)</label>
                                     <input type="number" name="depth_warning_threshold" class="setting-input"
                                            value="} . ($config->{depth_warning_threshold}{value} || '5000') . qq{">
-                                    <div class="setting-description">Minimum depth at 2% before warning</div>
                                 </div>
                                 <div class="setting-item">
                                     <label class="setting-label">Critical Threshold (USD)</label>
                                     <input type="number" name="depth_critical_threshold" class="setting-input"
                                            value="} . ($config->{depth_critical_threshold}{value} || '2000') . qq{">
-                                    <div class="setting-description">Minimum depth at 2% before critical alert</div>
+                                </div>
+                            </div>
+
+                            <div class="setting-group">
+                                <h3>Exchange Monitoring</h3>
+                                <div class="setting-item">
+                                    <label class="setting-label">Monitor KuCoin</label>
+                                    <select name="kucoin_enabled" class="setting-input">
+                                        <option value="1" } . (($config->{kucoin_enabled}{value} || '') eq '1' ? 'selected' : '') . qq{>Enabled</option>
+                                        <option value="0" } . (($config->{kucoin_enabled}{value} || '') eq '0' ? 'selected' : '') . qq{>Disabled</option>
+                                    </select>
+                                </div>
+                                <div class="setting-item">
+                                    <label class="setting-label">Monitor MEXC</label>
+                                    <select name="mexc_enabled" class="setting-input">
+                                        <option value="1" } . (($config->{mexc_enabled}{value} || '') eq '1' ? 'selected' : '') . qq{>Enabled</option>
+                                        <option value="0" } . (($config->{mexc_enabled}{value} || '') eq '0' ? 'selected' : '') . qq{>Disabled</option>
+                                    </select>
+                                </div>
+                                <div class="setting-item">
+                                    <label class="setting-label">Monitoring Enabled</label>
+                                    <select name="monitoring_enabled" class="setting-input">
+                                        <option value="1" } . (($config->{monitoring_enabled}{value} || '') eq '1' ? 'selected' : '') . qq{>Enabled</option>
+                                        <option value="0" } . (($config->{monitoring_enabled}{value} || '') eq '0' ? 'selected' : '') . qq{>Disabled</option>
+                                    </select>
                                 </div>
                             </div>
 
@@ -1431,44 +1484,11 @@ sub render_settings_tab {
                                     <label class="setting-label">Price Change Warning (%)</label>
                                     <input type="number" step="0.1" name="price_change_warning" class="setting-input"
                                            value="} . ($config->{price_change_warning}{value} || '5.0') . qq{">
-                                    <div class="setting-description">24h price change % for warning</div>
-                                </div>
-                                <div class="setting-item">
-                                    <label class="setting-label">Price Change Critical (%)</label>
-                                    <input type="number" step="0.1" name="price_change_critical" class="setting-input"
-                                           value="} . ($config->{price_change_critical}{value} || '10.0') . qq{">
-                                    <div class="setting-description">24h price change % for critical alert</div>
                                 </div>
                                 <div class="setting-item">
                                     <label class="setting-label">Liquidity Pull Threshold (%)</label>
                                     <input type="number" step="0.1" name="liquidity_pull_threshold" class="setting-input"
                                            value="} . ($config->{liquidity_pull_threshold}{value} || '15.0') . qq{">
-                                    <div class="setting-description">Volatility % to recommend pulling liquidity</div>
-                                </div>
-                            </div>
-
-                            <div class="setting-group">
-                                <h3>Exchange Monitoring</h3>
-                                <div class="setting-item">
-                                    <label class="setting-label">Monitor KuCoin</label>
-                                    <select name="kucoin_enabled" class="setting-input">
-                                        <option value="1" } . ($config->{kucoin_enabled}{value} eq '1' ? 'selected' : '') . qq{>Enabled</option>
-                                        <option value="0" } . ($config->{kucoin_enabled}{value} eq '0' ? 'selected' : '') . qq{>Disabled</option>
-                                    </select>
-                                </div>
-                                <div class="setting-item">
-                                    <label class="setting-label">Monitor MEXC</label>
-                                    <select name="mexc_enabled" class="setting-input">
-                                        <option value="1" } . ($config->{mexc_enabled}{value} eq '1' ? 'selected' : '') . qq{>Enabled</option>
-                                        <option value="0" } . ($config->{mexc_enabled}{value} eq '0' ? 'selected' : '') . qq{>Disabled</option>
-                                    </select>
-                                </div>
-                                <div class="setting-item">
-                                    <label class="setting-label">Monitoring Enabled</label>
-                                    <select name="monitoring_enabled" class="setting-input">
-                                        <option value="1" } . ($config->{monitoring_enabled}{value} eq '1' ? 'selected' : '') . qq{>Enabled</option>
-                                        <option value="0" } . ($config->{monitoring_enabled}{value} eq '0' ? 'selected' : '') . qq{>Disabled</option>
-                                    </select>
                                 </div>
                             </div>
 
@@ -1478,7 +1498,7 @@ sub render_settings_tab {
                                     <label class="setting-label">Volume Spike Multiplier</label>
                                     <input type="number" step="0.1" name="volume_spike_threshold" class="setting-input"
                                            value="} . ($config->{volume_spike_threshold}{value} || '3.0') . qq{">
-                                    <div class="setting-description">Volume vs 24h average to flag as spike (e.g., 3.0 = 3x average)</div>
+                                    <div class="setting-description">Volume vs 24h average to flag as spike</div>
                                 </div>
                             </div>
                         </div>
@@ -1514,34 +1534,22 @@ sub main {
     my $q = CGI->new();
     my $dbh = get_db_connection();
 
-    # Get session cookie
     my %cookies = CGI::Cookie->fetch();
     my $session_id = $cookies{'ergo_mm_session'} ? $cookies{'ergo_mm_session'}->value() : undef;
 
-    # Handle logout
     if ($q->param('logout')) {
         destroy_session($dbh, $session_id) if $session_id;
-        my $cookie = CGI::Cookie->new(
-            -name => 'ergo_mm_session',
-            -value => '',
-            -expires => '-1d'
-        );
+        my $cookie = CGI::Cookie->new(-name => 'ergo_mm_session', -value => '', -expires => '-1d');
         print $q->redirect(-uri => $q->url(), -cookie => $cookie);
         return;
     }
 
-    # Handle login POST
     if ($q->request_method() eq 'POST' && !validate_session($dbh, $session_id)) {
-        my $password = $q->param('password');
+        my $password = $q->param('password') || '';
 
         if ($password eq $DASHBOARD_PASSWORD) {
             $session_id = create_session($dbh, $ENV{REMOTE_ADDR} || '0.0.0.0');
-            my $cookie = CGI::Cookie->new(
-                -name => 'ergo_mm_session',
-                -value => $session_id,
-                -expires => '+24h',
-                -httponly => 1
-            );
+            my $cookie = CGI::Cookie->new(-name => 'ergo_mm_session', -value => $session_id, -expires => '+24h', -httponly => 1);
             print $q->redirect(-uri => $q->url(), -cookie => $cookie);
             return;
         } else {
@@ -1550,14 +1558,12 @@ sub main {
         }
     }
 
-    # Check authentication
     unless (validate_session($dbh, $session_id)) {
         render_login_page();
         return;
     }
 
-    # Handle settings save
-    if ($q->param('action') eq 'save' && $q->request_method() eq 'POST') {
+    if (($q->param('action') || '') eq 'save' && $q->request_method() eq 'POST') {
         my @settings = qw(
             discord_webhook alert_cooldown_minutes
             spread_warning_threshold spread_critical_threshold
@@ -1578,7 +1584,6 @@ sub main {
         return;
     }
 
-    # Render dashboard
     my $tab = $q->param('tab') || 'overview';
     render_dashboard($dbh, $tab);
 
