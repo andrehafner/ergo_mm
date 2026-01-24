@@ -398,7 +398,7 @@ sub html_header {
             background: var(--accent-red);
         }
 
-        @keyframes pulse {
+        \@keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
@@ -869,7 +869,7 @@ sub html_header {
         }
 
         /* Responsive */
-        @media (max-width: 1200px) {
+        \@media (max-width: 1200px) {
             .exchange-card {
                 grid-column: span 12;
             }
@@ -879,7 +879,7 @@ sub html_header {
             }
         }
 
-        @media (max-width: 768px) {
+        \@media (max-width: 768px) {
             .container {
                 padding: 12px;
             }
