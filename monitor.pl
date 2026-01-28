@@ -11,8 +11,12 @@ use DBI;
 use LWP::UserAgent;
 use JSON;
 use POSIX qw(strftime);
-use Time::HiRes qw(time);
-use Digest::SHA qw(sha256_hex);
+use Time::HiRes qw(time gettimeofday);
+use Digest::SHA qw(sha256_hex hmac_sha256_hex hmac_sha256);
+use MIME::Base64;
+
+# Global API keys (loaded from config file)
+our %API_KEYS;
 
 # ============================================================
 # DATABASE CONNECTION
@@ -37,6 +41,43 @@ sub get_db_connection {
     ) or die "Can't connect to database: $DBI::errstr\n";
 
     return $dbh;
+}
+
+# ============================================================
+# API KEYS LOADER
+# ============================================================
+sub load_api_keys {
+    my $config_file = '/usr/lib/cgi-bin/api_keys.conf';
+
+    unless (-f $config_file) {
+        print "API keys config file not found at $config_file\n";
+        print "Create it with your MEXC and KuCoin API keys to enable balance/order tracking.\n";
+        return;
+    }
+
+    open my $fh, '<', $config_file or do {
+        warn "Cannot open API keys file: $!";
+        return;
+    };
+
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;  # Skip comments and empty lines
+        if (/^(\w+)\s*=\s*(.*)$/) {
+            my ($key, $value) = ($1, $2);
+            $value =~ s/^\s+//;
+            $value =~ s/\s+$//;
+            $API_KEYS{$key} = $value;
+        }
+    }
+    close $fh;
+
+    # Validate required keys
+    my $mexc_ready = $API_KEYS{MEXC_ACCESS_KEY} && $API_KEYS{MEXC_SECRET_KEY};
+    my $kucoin_ready = $API_KEYS{KUCOIN_KEY} && $API_KEYS{KUCOIN_SECRET} && $API_KEYS{KUCOIN_PASSPHRASE};
+
+    print "API Keys Status: MEXC=" . ($mexc_ready ? "Ready" : "Missing") .
+          ", KuCoin=" . ($kucoin_ready ? "Ready" : "Missing") . "\n";
 }
 
 # ============================================================
@@ -109,6 +150,73 @@ sub fetch_mexc_trades {
     return undef;
 }
 
+# MEXC Authenticated API Functions
+sub mexc_sign_request {
+    my ($params) = @_;
+    my $query_string = join('&', map { "$_=$params->{$_}" } sort keys %$params);
+    my $signature = hmac_sha256_hex($query_string, $API_KEYS{MEXC_SECRET_KEY});
+    return ($query_string, $signature);
+}
+
+sub fetch_mexc_balance {
+    my ($ua) = @_;
+
+    return undef unless $API_KEYS{MEXC_ACCESS_KEY} && $API_KEYS{MEXC_SECRET_KEY};
+
+    my $timestamp = int(time * 1000);
+    my $params = { timestamp => $timestamp };
+    my ($query_string, $signature) = mexc_sign_request($params);
+
+    my $url = "https://api.mexc.com/api/v3/account?$query_string&signature=$signature";
+
+    my $response = $ua->get($url,
+        'X-MEXC-APIKEY' => $API_KEYS{MEXC_ACCESS_KEY}
+    );
+
+    if ($response->is_success) {
+        my $data = decode_json($response->decoded_content);
+        # Extract ERG and USDT balances
+        my %balances;
+        foreach my $asset (@{$data->{balances} || []}) {
+            if ($asset->{asset} eq 'ERG' || $asset->{asset} eq 'USDT') {
+                $balances{$asset->{asset}} = {
+                    free => $asset->{free} + 0,
+                    locked => $asset->{locked} + 0,
+                    total => ($asset->{free} + 0) + ($asset->{locked} + 0)
+                };
+            }
+        }
+        return \%balances;
+    }
+    warn "MEXC balance fetch failed: " . $response->status_line . " - " . $response->decoded_content;
+    return undef;
+}
+
+sub fetch_mexc_open_orders {
+    my ($ua) = @_;
+
+    return undef unless $API_KEYS{MEXC_ACCESS_KEY} && $API_KEYS{MEXC_SECRET_KEY};
+
+    my $timestamp = int(time * 1000);
+    my $params = {
+        symbol => 'ERGUSDT',
+        timestamp => $timestamp
+    };
+    my ($query_string, $signature) = mexc_sign_request($params);
+
+    my $url = "https://api.mexc.com/api/v3/openOrders?$query_string&signature=$signature";
+
+    my $response = $ua->get($url,
+        'X-MEXC-APIKEY' => $API_KEYS{MEXC_ACCESS_KEY}
+    );
+
+    if ($response->is_success) {
+        return decode_json($response->decoded_content);
+    }
+    warn "MEXC open orders fetch failed: " . $response->status_line . " - " . $response->decoded_content;
+    return undef;
+}
+
 # ============================================================
 # KUCOIN API FUNCTIONS
 # ============================================================
@@ -148,6 +256,90 @@ sub fetch_kucoin_trades {
         return $data->{data} if $data->{code} eq '200000';
     }
     warn "KuCoin trades fetch failed: " . $response->status_line;
+    return undef;
+}
+
+# KuCoin Authenticated API Functions
+sub kucoin_sign_request {
+    my ($timestamp, $method, $endpoint, $body) = @_;
+    $body //= '';
+
+    my $str_to_sign = $timestamp . $method . $endpoint . $body;
+    my $signature = encode_base64(hmac_sha256($str_to_sign, $API_KEYS{KUCOIN_SECRET}), '');
+    my $passphrase = encode_base64(hmac_sha256($API_KEYS{KUCOIN_PASSPHRASE}, $API_KEYS{KUCOIN_SECRET}), '');
+
+    return ($signature, $passphrase);
+}
+
+sub fetch_kucoin_balance {
+    my ($ua) = @_;
+
+    return undef unless $API_KEYS{KUCOIN_KEY} && $API_KEYS{KUCOIN_SECRET} && $API_KEYS{KUCOIN_PASSPHRASE};
+
+    my $timestamp = int(time * 1000);
+    my $endpoint = '/api/v1/accounts';
+    my $method = 'GET';
+
+    my ($signature, $passphrase) = kucoin_sign_request($timestamp, $method, $endpoint);
+
+    my $response = $ua->get(
+        "https://api.kucoin.com$endpoint",
+        'KC-API-KEY' => $API_KEYS{KUCOIN_KEY},
+        'KC-API-SIGN' => $signature,
+        'KC-API-TIMESTAMP' => $timestamp,
+        'KC-API-PASSPHRASE' => $passphrase,
+        'KC-API-KEY-VERSION' => '2'
+    );
+
+    if ($response->is_success) {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{code} eq '200000') {
+            # Extract ERG and USDT balances from trading accounts
+            my %balances;
+            foreach my $account (@{$data->{data} || []}) {
+                if (($account->{currency} eq 'ERG' || $account->{currency} eq 'USDT')
+                    && $account->{type} eq 'trade') {
+                    $balances{$account->{currency}} = {
+                        free => $account->{available} + 0,
+                        locked => $account->{holds} + 0,
+                        total => $account->{balance} + 0
+                    };
+                }
+            }
+            return \%balances;
+        }
+    }
+    warn "KuCoin balance fetch failed: " . $response->status_line . " - " . $response->decoded_content;
+    return undef;
+}
+
+sub fetch_kucoin_open_orders {
+    my ($ua) = @_;
+
+    return undef unless $API_KEYS{KUCOIN_KEY} && $API_KEYS{KUCOIN_SECRET} && $API_KEYS{KUCOIN_PASSPHRASE};
+
+    my $timestamp = int(time * 1000);
+    my $endpoint = '/api/v1/orders?status=active&symbol=ERG-USDT';
+    my $method = 'GET';
+
+    my ($signature, $passphrase) = kucoin_sign_request($timestamp, $method, $endpoint);
+
+    my $response = $ua->get(
+        "https://api.kucoin.com$endpoint",
+        'KC-API-KEY' => $API_KEYS{KUCOIN_KEY},
+        'KC-API-SIGN' => $signature,
+        'KC-API-TIMESTAMP' => $timestamp,
+        'KC-API-PASSPHRASE' => $passphrase,
+        'KC-API-KEY-VERSION' => '2'
+    );
+
+    if ($response->is_success) {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{code} eq '200000') {
+            return $data->{data}{items} || [];
+        }
+    }
+    warn "KuCoin open orders fetch failed: " . $response->status_line . " - " . $response->decoded_content;
     return undef;
 }
 
@@ -264,6 +456,177 @@ sub store_trades {
             $trade->{isBuyerMaker} ? 'sell' : 'buy',
             $trade_time
         );
+    }
+    $sth->finish();
+}
+
+# ============================================================
+# USER BALANCE AND ORDER TRACKING
+# ============================================================
+sub store_user_balance {
+    my ($dbh, $exchange, $balances, $current_price) = @_;
+
+    return unless $balances;
+
+    my $sql = qq{
+        INSERT INTO user_balances
+        (exchange, erg_free, erg_locked, erg_total, usdt_free, usdt_locked, usdt_total, total_value_usd)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    };
+
+    my $erg = $balances->{ERG} || { free => 0, locked => 0, total => 0 };
+    my $usdt = $balances->{USDT} || { free => 0, locked => 0, total => 0 };
+    my $total_value = ($erg->{total} * $current_price) + $usdt->{total};
+
+    my $sth = $dbh->prepare($sql);
+    $sth->execute(
+        $exchange,
+        $erg->{free},
+        $erg->{locked},
+        $erg->{total},
+        $usdt->{free},
+        $usdt->{locked},
+        $usdt->{total},
+        $total_value
+    );
+    $sth->finish();
+
+    print sprintf("  Balance: %.2f ERG (%.2f locked), %.2f USDT (%.2f locked) = \$%.2f total\n",
+        $erg->{total}, $erg->{locked}, $usdt->{total}, $usdt->{locked}, $total_value);
+}
+
+sub store_user_orders {
+    my ($dbh, $exchange, $orders) = @_;
+
+    return unless $orders && @$orders;
+
+    # Clear existing orders for this exchange and insert fresh
+    $dbh->do("DELETE FROM user_open_orders WHERE exchange = ?", undef, $exchange);
+
+    my $sql = qq{
+        INSERT INTO user_open_orders
+        (exchange, order_id, side, price, amount, amount_filled, order_type, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?))
+    };
+
+    my $sth = $dbh->prepare($sql);
+
+    foreach my $order (@$orders) {
+        my ($order_id, $side, $price, $amount, $filled, $order_type, $created);
+
+        if ($exchange eq 'MEXC') {
+            $order_id = $order->{orderId};
+            $side = lc($order->{side});
+            $price = $order->{price} + 0;
+            $amount = $order->{origQty} + 0;
+            $filled = $order->{executedQty} + 0;
+            $order_type = $order->{type};
+            $created = $order->{time} / 1000;
+        } else {  # KuCoin
+            $order_id = $order->{id};
+            $side = $order->{side};
+            $price = $order->{price} + 0;
+            $amount = $order->{size} + 0;
+            $filled = $order->{dealSize} + 0;
+            $order_type = $order->{type};
+            $created = $order->{createdAt} / 1000;
+        }
+
+        $sth->execute($exchange, $order_id, $side, $price, $amount, $filled, $order_type, $created);
+    }
+    $sth->finish();
+
+    print sprintf("  Stored %d open orders\n", scalar(@$orders));
+}
+
+sub calculate_user_depth {
+    my ($orders, $mid_price, $percentage, $side) = @_;
+
+    return (0, 0) unless $orders && @$orders;
+
+    my $threshold_price;
+    if ($side eq 'bid') {
+        $threshold_price = $mid_price * (1 - $percentage / 100);
+    } else {
+        $threshold_price = $mid_price * (1 + $percentage / 100);
+    }
+
+    my $total_amount = 0;
+    my $total_usd = 0;
+
+    foreach my $order (@$orders) {
+        my ($price, $amount, $order_side);
+
+        # Handle both MEXC and KuCoin order formats
+        if (exists $order->{origQty}) {  # MEXC
+            $price = $order->{price} + 0;
+            $amount = ($order->{origQty} + 0) - ($order->{executedQty} + 0);  # Remaining
+            $order_side = lc($order->{side});
+        } else {  # KuCoin
+            $price = $order->{price} + 0;
+            $amount = ($order->{size} + 0) - ($order->{dealSize} + 0);  # Remaining
+            $order_side = $order->{side};
+        }
+
+        # Only count orders on the correct side
+        next if ($side eq 'bid' && $order_side ne 'buy');
+        next if ($side eq 'ask' && $order_side ne 'sell');
+
+        # Check if within price range
+        if ($side eq 'bid') {
+            next if $price < $threshold_price;
+        } else {
+            next if $price > $threshold_price;
+        }
+
+        $total_amount += $amount;
+        $total_usd += $amount * $price;
+    }
+
+    return ($total_amount, $total_usd);
+}
+
+sub store_user_depth {
+    my ($dbh, $exchange, $orders, $mid_price, $market_depth) = @_;
+
+    return unless $orders;
+
+    my $sql = qq{
+        INSERT INTO user_orderbook_depth
+        (exchange, depth_level, bid_depth_erg, bid_depth_usd, ask_depth_erg, ask_depth_usd,
+         market_bid_usd, market_ask_usd, bid_share_pct, ask_share_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    };
+
+    my $sth = $dbh->prepare($sql);
+
+    foreach my $pct (2, 5, 10) {
+        my ($user_bid_erg, $user_bid_usd) = calculate_user_depth($orders, $mid_price, $pct, 'bid');
+        my ($user_ask_erg, $user_ask_usd) = calculate_user_depth($orders, $mid_price, $pct, 'ask');
+
+        my $market_bid = $market_depth->{"$pct%"}{bid_usd} || 0;
+        my $market_ask = $market_depth->{"$pct%"}{ask_usd} || 0;
+
+        my $bid_share = $market_bid > 0 ? ($user_bid_usd / $market_bid) * 100 : 0;
+        my $ask_share = $market_ask > 0 ? ($user_ask_usd / $market_ask) * 100 : 0;
+
+        $sth->execute(
+            $exchange,
+            "$pct%",
+            $user_bid_erg,
+            $user_bid_usd,
+            $user_ask_erg,
+            $user_ask_usd,
+            $market_bid,
+            $market_ask,
+            $bid_share,
+            $ask_share
+        );
+
+        if ($user_bid_usd > 0 || $user_ask_usd > 0) {
+            print sprintf("  Your depth at %d%%: Bid \$%.2f (%.1f%%), Ask \$%.2f (%.1f%%)\n",
+                $pct, $user_bid_usd, $bid_share, $user_ask_usd, $ask_share);
+        }
     }
     $sth->finish();
 }
@@ -425,7 +788,7 @@ sub add_recommendation {
 }
 
 sub analyze_and_recommend {
-    my ($dbh, $config, $exchange, $price_data, $depth_data) = @_;
+    my ($dbh, $config, $exchange, $price_data, $depth_data, $user_orders) = @_;
 
     my @alerts;
     my @recommendations;
@@ -525,6 +888,71 @@ sub analyze_and_recommend {
             'High volatility detected. Consider reducing position sizes.', 7, 6);
     }
 
+    # Check user order inventory imbalance (only if we have user orders)
+    if ($user_orders && @$user_orders) {
+        my $mid_price = ($price_data->{bid_price} + $price_data->{ask_price}) / 2;
+        my ($user_bid_erg, $user_bid_usd) = calculate_user_depth($user_orders, $mid_price, 5, 'bid');
+        my ($user_ask_erg, $user_ask_usd) = calculate_user_depth($user_orders, $mid_price, 5, 'ask');
+
+        my $total_user_depth = $user_bid_usd + $user_ask_usd;
+
+        if ($total_user_depth > 0) {
+            my $bid_ratio = $user_bid_usd / $total_user_depth;
+            my $ask_ratio = $user_ask_usd / $total_user_depth;
+
+            # Alert if inventory is heavily imbalanced (more than 70% on one side)
+            if ($bid_ratio > 0.7) {
+                push @alerts, {
+                    type     => 'INVENTORY_IMBALANCE',
+                    severity => 'warning',
+                    message  => sprintf("%s: Heavy bid-side exposure (%.1f%% of orders). You may accumulate excess ERG.",
+                        $exchange, $bid_ratio * 100),
+                    fields   => [
+                        { name => 'Bid Orders', value => sprintf("\$%.2f", $user_bid_usd), inline => 'true' },
+                        { name => 'Ask Orders', value => sprintf("\$%.2f", $user_ask_usd), inline => 'true' },
+                        { name => 'Imbalance', value => sprintf("%.1f%% bids", $bid_ratio * 100), inline => 'true' }
+                    ]
+                };
+                add_recommendation($dbh, $exchange, 'INVENTORY', 'REBALANCE_ASK',
+                    'Order book heavily weighted to bids. Consider adding more sell orders or reducing buy orders.', 6, 4);
+            }
+            elsif ($ask_ratio > 0.7) {
+                push @alerts, {
+                    type     => 'INVENTORY_IMBALANCE',
+                    severity => 'warning',
+                    message  => sprintf("%s: Heavy ask-side exposure (%.1f%% of orders). You may deplete ERG reserves.",
+                        $exchange, $ask_ratio * 100),
+                    fields   => [
+                        { name => 'Bid Orders', value => sprintf("\$%.2f", $user_bid_usd), inline => 'true' },
+                        { name => 'Ask Orders', value => sprintf("\$%.2f", $user_ask_usd), inline => 'true' },
+                        { name => 'Imbalance', value => sprintf("%.1f%% asks", $ask_ratio * 100), inline => 'true' }
+                    ]
+                };
+                add_recommendation($dbh, $exchange, 'INVENTORY', 'REBALANCE_BID',
+                    'Order book heavily weighted to asks. Consider adding more buy orders or reducing sell orders.', 6, 4);
+            }
+        }
+
+        # Check if user has very low liquidity share compared to market
+        my $market_depth_5pct = ($depth_data->{'5%'}{bid_usd} || 0) + ($depth_data->{'5%'}{ask_usd} || 0);
+        if ($market_depth_5pct > 0 && $total_user_depth > 0) {
+            my $user_share = ($total_user_depth / $market_depth_5pct) * 100;
+            if ($user_share < 5) {
+                push @alerts, {
+                    type     => 'LOW_LIQUIDITY_SHARE',
+                    severity => 'info',
+                    message  => sprintf("%s: Your liquidity share is only %.1f%% of 5%% depth. Consider adding more orders.",
+                        $exchange, $user_share),
+                    fields   => [
+                        { name => 'Your Depth', value => sprintf("\$%.2f", $total_user_depth), inline => 'true' },
+                        { name => 'Market Depth', value => sprintf("\$%.2f", $market_depth_5pct), inline => 'true' },
+                        { name => 'Your Share', value => sprintf("%.1f%%", $user_share), inline => 'true' }
+                    ]
+                };
+            }
+        }
+    }
+
     return \@alerts;
 }
 
@@ -587,11 +1015,25 @@ sub process_mexc {
         store_trades($dbh, 'MEXC', $trades, $price_data->{price});
     }
 
+    # Fetch and store user balance and orders if API keys available
+    my $user_orders;
+    if ($API_KEYS{MEXC_ACCESS_KEY}) {
+        print "  Fetching MEXC user data...\n";
+        my $balances = fetch_mexc_balance($ua);
+        store_user_balance($dbh, 'MEXC', $balances, $price_data->{price}) if $balances;
+
+        $user_orders = fetch_mexc_open_orders($ua);
+        if ($user_orders) {
+            store_user_orders($dbh, 'MEXC', $user_orders);
+            store_user_depth($dbh, 'MEXC', $user_orders, $mid_price, \%depth_data);
+        }
+    }
+
     # Calculate metrics
     calculate_and_store_metrics($dbh, 'MEXC');
 
     # Analyze and generate alerts
-    my $alerts = analyze_and_recommend($dbh, $config, 'MEXC', $price_data, \%depth_data);
+    my $alerts = analyze_and_recommend($dbh, $config, 'MEXC', $price_data, \%depth_data, $user_orders);
 
     return $alerts;
 }
@@ -668,11 +1110,25 @@ sub process_kucoin {
         store_trades($dbh, 'KUCOIN', \@formatted_trades, $price_data->{price});
     }
 
+    # Fetch and store user balance and orders if API keys available
+    my $user_orders;
+    if ($API_KEYS{KUCOIN_KEY}) {
+        print "  Fetching KuCoin user data...\n";
+        my $balances = fetch_kucoin_balance($ua);
+        store_user_balance($dbh, 'KUCOIN', $balances, $price_data->{price}) if $balances;
+
+        $user_orders = fetch_kucoin_open_orders($ua);
+        if ($user_orders) {
+            store_user_orders($dbh, 'KUCOIN', $user_orders);
+            store_user_depth($dbh, 'KUCOIN', $user_orders, $mid_price, \%depth_data);
+        }
+    }
+
     # Calculate metrics
     calculate_and_store_metrics($dbh, 'KUCOIN');
 
     # Analyze and generate alerts
-    my $alerts = analyze_and_recommend($dbh, $config, 'KUCOIN', $price_data, \%depth_data);
+    my $alerts = analyze_and_recommend($dbh, $config, 'KUCOIN', $price_data, \%depth_data, $user_orders);
 
     return $alerts;
 }
@@ -685,6 +1141,9 @@ sub main {
     print "=" x 60 . "\n";
     print "ERGO MM Monitor - " . strftime("%Y-%m-%d %H:%M:%S", localtime()) . "\n";
     print "=" x 60 . "\n";
+
+    # Load API keys from config file
+    load_api_keys();
 
     my $dbh = get_db_connection();
     my $config = load_config($dbh);

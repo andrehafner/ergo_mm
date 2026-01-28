@@ -1,0 +1,24 @@
+# ============================================================
+# ERGO MM API Keys Configuration
+# Copy this file to /usr/lib/cgi-bin/api_keys.conf
+# and fill in your API keys
+# ============================================================
+
+# MEXC API Keys (read-only recommended)
+# Get from: https://www.mexc.com/user/openapi
+MEXC_ACCESS_KEY=your_mexc_access_key_here
+MEXC_SECRET_KEY=your_mexc_secret_key_here
+
+# KuCoin API Keys (read-only recommended)
+# Get from: https://www.kucoin.com/account/api
+# Note: KuCoin requires a passphrase in addition to key/secret
+KUCOIN_KEY=your_kucoin_api_key_here
+KUCOIN_SECRET=your_kucoin_api_secret_here
+KUCOIN_PASSPHRASE=your_kucoin_passphrase_here
+
+# ============================================================
+# IMPORTANT SECURITY NOTES:
+# 1. Use read-only API keys only (no trading permissions needed)
+# 2. Set this file permissions: chmod 600 /usr/lib/cgi-bin/api_keys.conf
+# 3. Never commit this file to version control
+# ============================================================
