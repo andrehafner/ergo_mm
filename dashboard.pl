@@ -239,6 +239,42 @@ sub get_config {
     return \%config;
 }
 
+sub get_latest_user_balances {
+    my ($dbh) = @_;
+    my $sth = $dbh->prepare("SELECT * FROM v_latest_user_balances ORDER BY exchange");
+    $sth->execute();
+    my %results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        $results{$row->{exchange}} = $row;
+    }
+    $sth->finish();
+    return \%results;
+}
+
+sub get_latest_user_depth {
+    my ($dbh) = @_;
+    my $sth = $dbh->prepare("SELECT * FROM v_latest_user_depth ORDER BY exchange, depth_level");
+    $sth->execute();
+    my %results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        $results{$row->{exchange}}{$row->{depth_level}} = $row;
+    }
+    $sth->finish();
+    return \%results;
+}
+
+sub get_user_open_orders {
+    my ($dbh) = @_;
+    my $sth = $dbh->prepare("SELECT * FROM user_open_orders ORDER BY exchange, side, price");
+    $sth->execute();
+    my %results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        push @{$results{$row->{exchange}}{$row->{side}}}, $row;
+    }
+    $sth->finish();
+    return \%results;
+}
+
 sub update_config {
     my ($dbh, $key, $value) = @_;
     $dbh->do(
@@ -466,6 +502,117 @@ sub html_header {
         .depth-table tr:last-child td { border-bottom: none; }
         .bid-value { color: var(--accent-green); }
         .ask-value { color: var(--accent-red); }
+
+        /* User Liquidity Section Styles */
+        .section-divider {
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--border-color), transparent);
+            margin: 20px 0;
+        }
+
+        .user-liquidity-section {
+            background: rgba(0, 212, 170, 0.05);
+            border: 1px solid rgba(0, 212, 170, 0.2);
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 16px;
+        }
+
+        .section-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--accent-cyan);
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .balance-row {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .balance-box {
+            flex: 1;
+            background: var(--bg-tertiary);
+            padding: 12px;
+            border-radius: 6px;
+        }
+
+        .balance-box.highlight {
+            background: linear-gradient(135deg, rgba(0, 212, 170, 0.2), rgba(59, 130, 246, 0.2));
+            border: 1px solid rgba(0, 212, 170, 0.3);
+        }
+
+        .balance-label {
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .balance-value {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .balance-detail {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        .user-depth-table {
+            margin-top: 12px;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+        }
+
+        .user-depth-table td.highlight {
+            color: var(--accent-cyan);
+            font-weight: 600;
+        }
+
+        .orders-summary {
+            display: flex;
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .orders-box {
+            flex: 1;
+            padding: 12px;
+            border-radius: 6px;
+            text-align: center;
+        }
+
+        .orders-box.bid-orders {
+            background: rgba(34, 197, 94, 0.15);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+        }
+
+        .orders-box.ask-orders {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+
+        .orders-label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+
+        .orders-count {
+            font-size: 24px;
+            font-weight: 600;
+            margin-top: 4px;
+        }
+
+        .bid-orders .orders-count { color: var(--accent-green); }
+        .ask-orders .orders-count { color: var(--accent-red); }
 
         .tabs {
             display: flex;
@@ -758,6 +905,11 @@ sub render_dashboard {
 sub render_overview_tab {
     my ($dbh, $prices, $depth, $metrics, $recommendations, $alerts, $chart_data) = @_;
 
+    # Fetch user balance and depth data
+    my $user_balances = get_latest_user_balances($dbh);
+    my $user_depth = get_latest_user_depth($dbh);
+    my $user_orders = get_user_open_orders($dbh);
+
     print qq{<div class="dashboard-grid">};
 
     # Exchange Cards
@@ -891,6 +1043,112 @@ sub render_overview_tab {
                         </tr>
             };
         }
+
+        # Display user liquidity data if available
+        my $user_bal = $user_balances->{$exchange};
+        my $user_dep = $user_depth->{$exchange} || {};
+        my $user_ord = $user_orders->{$exchange} || {};
+
+        if ($user_bal || %$user_dep) {
+            print qq{
+                    </tbody>
+                </table>
+
+                <div class="section-divider"></div>
+                <div class="user-liquidity-section">
+                    <h4 class="section-title">Your Liquidity</h4>
+            };
+
+            # Display balances
+            if ($user_bal) {
+                print qq{
+                    <div class="balance-row">
+                        <div class="balance-box">
+                            <div class="balance-label">ERG Balance</div>
+                            <div class="balance-value">} . sprintf("%.2f", $user_bal->{erg_total} || 0) . qq{</div>
+                            <div class="balance-detail">Free: } . sprintf("%.2f", $user_bal->{erg_free} || 0) . qq{ | In Orders: } . sprintf("%.2f", $user_bal->{erg_locked} || 0) . qq{</div>
+                        </div>
+                        <div class="balance-box">
+                            <div class="balance-label">USDT Balance</div>
+                            <div class="balance-value">\$} . sprintf("%.2f", $user_bal->{usdt_total} || 0) . qq{</div>
+                            <div class="balance-detail">Free: \$} . sprintf("%.2f", $user_bal->{usdt_free} || 0) . qq{ | In Orders: \$} . sprintf("%.2f", $user_bal->{usdt_locked} || 0) . qq{</div>
+                        </div>
+                        <div class="balance-box highlight">
+                            <div class="balance-label">Total Value</div>
+                            <div class="balance-value">\$} . sprintf("%.2f", $user_bal->{total_value_usd} || 0) . qq{</div>
+                        </div>
+                    </div>
+                };
+            }
+
+            # Display user depth share table
+            if (%$user_dep) {
+                print qq{
+                    <table class="depth-table user-depth-table">
+                        <thead>
+                            <tr>
+                                <th>Depth</th>
+                                <th>Your Bids</th>
+                                <th>Your Asks</th>
+                                <th>Bid Share</th>
+                                <th>Ask Share</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                };
+
+                foreach my $level ('2%', '5%', '10%') {
+                    my $ud = $user_dep->{$level} || {};
+                    my $bid_share = $ud->{bid_share_pct} || 0;
+                    my $ask_share = $ud->{ask_share_pct} || 0;
+                    my $bid_class = $bid_share > 20 ? 'highlight' : '';
+                    my $ask_class = $ask_share > 20 ? 'highlight' : '';
+
+                    print qq{
+                            <tr>
+                                <td>$level</td>
+                                <td class="bid-value">\$} . format_number($ud->{bid_depth_usd} || 0) . qq{</td>
+                                <td class="ask-value">\$} . format_number($ud->{ask_depth_usd} || 0) . qq{</td>
+                                <td class="$bid_class">} . sprintf("%.1f", $bid_share) . qq{%</td>
+                                <td class="$ask_class">} . sprintf("%.1f", $ask_share) . qq{%</td>
+                            </tr>
+                    };
+                }
+
+                print qq{
+                        </tbody>
+                    </table>
+                };
+            }
+
+            # Display open orders summary
+            my @buy_orders = @{$user_ord->{buy} || []};
+            my @sell_orders = @{$user_ord->{sell} || []};
+
+            if (@buy_orders || @sell_orders) {
+                print qq{
+                    <div class="orders-summary">
+                        <div class="orders-box bid-orders">
+                            <div class="orders-label">Buy Orders</div>
+                            <div class="orders-count">} . scalar(@buy_orders) . qq{</div>
+                        </div>
+                        <div class="orders-box ask-orders">
+                            <div class="orders-label">Sell Orders</div>
+                            <div class="orders-count">} . scalar(@sell_orders) . qq{</div>
+                        </div>
+                    </div>
+                };
+            }
+
+            print qq{
+                </div>
+            };
+        }
+
+        print qq{
+                    </tbody>
+                </table>
+        } unless ($user_bal || %$user_dep);
 
         my $buy_vol = $trade_summary->{buy_volume} || 0;
         my $sell_vol = $trade_summary->{sell_volume} || 0;
