@@ -6,23 +6,23 @@
 USE ergo_mm;
 
 -- ============================================================
--- ADD MISSING INDEXES
+-- ADD MISSING INDEXES (ignore errors if they already exist)
 -- ============================================================
 
 -- Index for user_balances view query
-ALTER TABLE user_balances ADD INDEX IF NOT EXISTS idx_exchange_timestamp (exchange, timestamp);
+CREATE INDEX idx_exchange_timestamp ON user_balances (exchange, timestamp);
 
 -- Index for user_orderbook_depth view query
-ALTER TABLE user_orderbook_depth ADD INDEX IF NOT EXISTS idx_exchange_depth_timestamp (exchange, depth_level, timestamp);
+CREATE INDEX idx_exchange_depth_ts ON user_orderbook_depth (exchange, depth_level, timestamp);
 
 -- Index for market_metrics view query
-ALTER TABLE market_metrics ADD INDEX IF NOT EXISTS idx_exchange_calculated (exchange, calculated_at);
+CREATE INDEX idx_exchange_calculated ON market_metrics (exchange, calculated_at);
 
 -- Better index for alerts
-ALTER TABLE alerts_log ADD INDEX IF NOT EXISTS idx_created_at (created_at);
+CREATE INDEX idx_alerts_created ON alerts_log (created_at);
 
 -- Better index for user_open_orders
-ALTER TABLE user_open_orders ADD INDEX IF NOT EXISTS idx_recorded (recorded_at);
+CREATE INDEX idx_orders_recorded ON user_open_orders (recorded_at);
 
 -- ============================================================
 -- CREATE OPTIMIZED VIEWS
