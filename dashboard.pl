@@ -101,7 +101,12 @@ sub destroy_session {
 # ============================================================
 sub get_latest_prices {
     my ($dbh) = @_;
-    my $sth = $dbh->prepare("SELECT * FROM v_latest_prices ORDER BY exchange");
+    # Direct query with LIMIT - much faster than view
+    my $sth = $dbh->prepare(qq{
+        (SELECT * FROM price_data WHERE exchange = 'MEXC' ORDER BY timestamp DESC LIMIT 1)
+        UNION ALL
+        (SELECT * FROM price_data WHERE exchange = 'KUCOIN' ORDER BY timestamp DESC LIMIT 1)
+    });
     $sth->execute();
     my @results;
     while (my $row = $sth->fetchrow_hashref()) {
@@ -113,7 +118,17 @@ sub get_latest_prices {
 
 sub get_latest_depth {
     my ($dbh) = @_;
-    my $sth = $dbh->prepare("SELECT * FROM v_latest_depth ORDER BY exchange, depth_level");
+    # Direct query for each exchange/level combo
+    my $sth = $dbh->prepare(qq{
+        SELECT * FROM orderbook_depth
+        WHERE (exchange, depth_level, timestamp) IN (
+            SELECT exchange, depth_level, MAX(timestamp)
+            FROM orderbook_depth
+            WHERE timestamp > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+            GROUP BY exchange, depth_level
+        )
+        ORDER BY exchange, depth_level
+    });
     $sth->execute();
     my %results;
     while (my $row = $sth->fetchrow_hashref()) {
@@ -125,7 +140,11 @@ sub get_latest_depth {
 
 sub get_latest_metrics {
     my ($dbh) = @_;
-    my $sth = $dbh->prepare("SELECT * FROM v_latest_metrics ORDER BY exchange");
+    my $sth = $dbh->prepare(qq{
+        (SELECT * FROM market_metrics WHERE exchange = 'MEXC' ORDER BY calculated_at DESC LIMIT 1)
+        UNION ALL
+        (SELECT * FROM market_metrics WHERE exchange = 'KUCOIN' ORDER BY calculated_at DESC LIMIT 1)
+    });
     $sth->execute();
     my %results;
     while (my $row = $sth->fetchrow_hashref()) {
@@ -137,7 +156,14 @@ sub get_latest_metrics {
 
 sub get_active_recommendations {
     my ($dbh) = @_;
-    my $sth = $dbh->prepare("SELECT * FROM v_active_recommendations LIMIT 10");
+    # Direct query instead of view
+    my $sth = $dbh->prepare(qq{
+        SELECT * FROM recommendations
+        WHERE is_active = 1
+          AND (expires_at IS NULL OR expires_at > NOW())
+        ORDER BY priority DESC, created_at DESC
+        LIMIT 10
+    });
     $sth->execute();
     my @results;
     while (my $row = $sth->fetchrow_hashref()) {
@@ -150,7 +176,13 @@ sub get_active_recommendations {
 sub get_recent_alerts {
     my ($dbh, $limit) = @_;
     $limit ||= 20;
-    my $sth = $dbh->prepare("SELECT * FROM v_recent_alerts LIMIT ?");
+    # Direct query instead of view
+    my $sth = $dbh->prepare(qq{
+        SELECT * FROM alerts_log
+        WHERE created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        ORDER BY created_at DESC
+        LIMIT ?
+    });
     $sth->execute($limit);
     my @results;
     while (my $row = $sth->fetchrow_hashref()) {
@@ -265,7 +297,12 @@ sub get_config {
 
 sub get_latest_user_balances {
     my ($dbh) = @_;
-    my $sth = $dbh->prepare("SELECT * FROM v_latest_user_balances ORDER BY exchange");
+    # Direct query - much faster than view
+    my $sth = $dbh->prepare(qq{
+        (SELECT * FROM user_balances WHERE exchange = 'MEXC' ORDER BY timestamp DESC LIMIT 1)
+        UNION ALL
+        (SELECT * FROM user_balances WHERE exchange = 'KUCOIN' ORDER BY timestamp DESC LIMIT 1)
+    });
     $sth->execute();
     my %results;
     while (my $row = $sth->fetchrow_hashref()) {
@@ -277,7 +314,18 @@ sub get_latest_user_balances {
 
 sub get_latest_user_depth {
     my ($dbh) = @_;
-    my $sth = $dbh->prepare("SELECT * FROM v_latest_user_depth ORDER BY exchange, depth_level");
+    # Direct query for recent data only
+    my $sth = $dbh->prepare(qq{
+        SELECT * FROM user_orderbook_depth
+        WHERE timestamp > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+        AND (exchange, depth_level, timestamp) IN (
+            SELECT exchange, depth_level, MAX(timestamp)
+            FROM user_orderbook_depth
+            WHERE timestamp > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+            GROUP BY exchange, depth_level
+        )
+        ORDER BY exchange, depth_level
+    });
     $sth->execute();
     my %results;
     while (my $row = $sth->fetchrow_hashref()) {
