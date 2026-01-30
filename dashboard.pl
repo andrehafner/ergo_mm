@@ -925,14 +925,14 @@ sub render_dashboard {
     my $alerts = get_recent_alerts($dbh, 20);
     my $config = get_config($dbh);
 
-    # Get chart data for each exchange (24h window for performance)
+    # Get chart data for each exchange (6h window for fast loading)
     my %chart_data;
     foreach my $exchange ('MEXC', 'KUCOIN') {
         $chart_data{$exchange} = {
-            price_history => get_price_history($dbh, $exchange, 24),
-            depth_history => get_depth_history($dbh, $exchange, 24),
-            trade_history => get_trade_history($dbh, $exchange, 24),
-            trade_summary => get_trade_summary($dbh, $exchange, 24),
+            price_history => get_price_history($dbh, $exchange, 6),
+            depth_history => get_depth_history($dbh, $exchange, 6),
+            trade_history => get_trade_history($dbh, $exchange, 6),
+            trade_summary => get_trade_summary($dbh, $exchange, 6),
         };
     }
 
