@@ -327,8 +327,8 @@ BEGIN
     -- Keep 30 days of orderbook depth
     DELETE FROM orderbook_depth WHERE timestamp < DATE_SUB(NOW(), INTERVAL 30 DAY);
 
-    -- Keep 7 days of trades
-    DELETE FROM trades WHERE recorded_at < DATE_SUB(NOW(), INTERVAL 7 DAY);
+    -- Keep 1 day of trades (table grows fast)
+    DELETE FROM trades WHERE recorded_at < DATE_SUB(NOW(), INTERVAL 1 DAY);
 
     -- Keep 90 days of alerts
     DELETE FROM alerts_log WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY);
