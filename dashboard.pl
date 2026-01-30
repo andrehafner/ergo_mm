@@ -164,9 +164,11 @@ sub get_price_history {
     my ($dbh, $exchange, $hours) = @_;
     $hours ||= 24;
 
+    # Aggregate by 5-minute buckets for better performance (max ~288 rows for 24h)
     my $sth = $dbh->prepare(qq{
         SELECT
-            DATE_FORMAT(timestamp, '%Y-%m-%d %H:%i') as time_bucket,
+            DATE_FORMAT(timestamp, '%Y-%m-%d %H:') as hour_part,
+            LPAD(FLOOR(MINUTE(timestamp) / 5) * 5, 2, '0') as min_bucket,
             AVG(price) as price,
             AVG(spread_percent) as spread,
             MAX(high_24h) as high,
@@ -175,12 +177,14 @@ sub get_price_history {
         FROM price_data
         WHERE exchange = ?
           AND timestamp > DATE_SUB(NOW(), INTERVAL ? HOUR)
-        GROUP BY time_bucket
-        ORDER BY time_bucket
+        GROUP BY hour_part, min_bucket
+        ORDER BY hour_part, min_bucket
+        LIMIT 300
     });
     $sth->execute($exchange, $hours);
     my @results;
     while (my $row = $sth->fetchrow_hashref()) {
+        $row->{time_bucket} = $row->{hour_part} . $row->{min_bucket};
         push @results, $row;
     }
     $sth->finish();
@@ -191,21 +195,25 @@ sub get_depth_history {
     my ($dbh, $exchange, $hours) = @_;
     $hours ||= 24;
 
+    # Aggregate by 15-minute buckets for better performance (max ~96 rows per level for 24h)
     my $sth = $dbh->prepare(qq{
         SELECT
-            DATE_FORMAT(timestamp, '%Y-%m-%d %H:%i') as time_bucket,
+            DATE_FORMAT(timestamp, '%Y-%m-%d %H:') as hour_part,
+            LPAD(FLOOR(MINUTE(timestamp) / 15) * 15, 2, '0') as min_bucket,
             depth_level,
             AVG(bid_depth_usd) as bid_depth,
             AVG(ask_depth_usd) as ask_depth
         FROM orderbook_depth
         WHERE exchange = ?
           AND timestamp > DATE_SUB(NOW(), INTERVAL ? HOUR)
-        GROUP BY time_bucket, depth_level
-        ORDER BY time_bucket, depth_level
+        GROUP BY hour_part, min_bucket, depth_level
+        ORDER BY hour_part, min_bucket, depth_level
+        LIMIT 500
     });
     $sth->execute($exchange, $hours);
     my @results;
     while (my $row = $sth->fetchrow_hashref()) {
+        $row->{time_bucket} = $row->{hour_part} . $row->{min_bucket};
         push @results, $row;
     }
     $sth->finish();
@@ -229,6 +237,7 @@ sub get_trade_history {
           AND recorded_at > DATE_SUB(NOW(), INTERVAL ? HOUR)
         GROUP BY time_bucket
         ORDER BY time_bucket
+        LIMIT 50
     });
     $sth->execute($exchange, $hours);
     my @results;
@@ -280,7 +289,13 @@ sub get_latest_user_depth {
 
 sub get_user_open_orders {
     my ($dbh) = @_;
-    my $sth = $dbh->prepare("SELECT * FROM user_open_orders ORDER BY exchange, side, price");
+    # Only get orders from the last 2 hours (should be current snapshot)
+    my $sth = $dbh->prepare(qq{
+        SELECT * FROM user_open_orders
+        WHERE recorded_at > DATE_SUB(NOW(), INTERVAL 2 HOUR)
+        ORDER BY exchange, side, price
+        LIMIT 200
+    });
     $sth->execute();
     my %results;
     while (my $row = $sth->fetchrow_hashref()) {
@@ -862,13 +877,13 @@ sub render_dashboard {
     my $alerts = get_recent_alerts($dbh, 20);
     my $config = get_config($dbh);
 
-    # Get chart data for each exchange
+    # Get chart data for each exchange (24h window for performance)
     my %chart_data;
     foreach my $exchange ('MEXC', 'KUCOIN') {
         $chart_data{$exchange} = {
-            price_history => get_price_history($dbh, $exchange, 48),
-            depth_history => get_depth_history($dbh, $exchange, 48),
-            trade_history => get_trade_history($dbh, $exchange, 48),
+            price_history => get_price_history($dbh, $exchange, 24),
+            depth_history => get_depth_history($dbh, $exchange, 24),
+            trade_history => get_trade_history($dbh, $exchange, 24),
             trade_summary => get_trade_summary($dbh, $exchange, 24),
         };
     }
