@@ -1276,12 +1276,30 @@ sub render_overview_tab {
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
                     plugins: {
                         legend: { display: false },
-                        title: { display: true, text: 'Price History', color: '#9aa0a6', font: { size: 12 } }
+                        title: { display: true, text: 'Price History', color: '#9aa0a6', font: { size: 12 } },
+                        tooltip: { mode: 'index', intersect: false }
                     },
                     scales: {
-                        x: { display: false },
+                        x: {
+                            display: true,
+                            grid: { display: false },
+                            ticks: {
+                                color: '#6b7280',
+                                maxTicksLimit: 6,
+                                font: { size: 9 },
+                                callback: function(value) {
+                                    const label = this.getLabelForValue(value);
+                                    if (label && label.length > 5) {
+                                        const parts = label.split(' ');
+                                        return parts.length > 1 ? parts[1] : label.slice(-5);
+                                    }
+                                    return label;
+                                }
+                            }
+                        },
                         y: {
                             grid: { color: '#374151' },
                             ticks: { color: '#9aa0a6', callback: v => '\$' + v.toFixed(4) }
@@ -1318,12 +1336,30 @@ sub render_overview_tab {
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
                     plugins: {
                         legend: { display: false },
-                        title: { display: true, text: 'Spread %', color: '#9aa0a6', font: { size: 12 } }
+                        title: { display: true, text: 'Spread %', color: '#9aa0a6', font: { size: 12 } },
+                        tooltip: { mode: 'index', intersect: false }
                     },
                     scales: {
-                        x: { display: false },
+                        x: {
+                            display: true,
+                            grid: { display: false },
+                            ticks: {
+                                color: '#6b7280',
+                                maxTicksLimit: 6,
+                                font: { size: 9 },
+                                callback: function(value) {
+                                    const label = this.getLabelForValue(value);
+                                    if (label && label.length > 5) {
+                                        const parts = label.split(' ');
+                                        return parts.length > 1 ? parts[1] : label.slice(-5);
+                                    }
+                                    return label;
+                                }
+                            }
+                        },
                         y: {
                             grid: { color: '#374151' },
                             ticks: { color: '#9aa0a6', callback: v => v.toFixed(2) + '%' },
@@ -1560,9 +1596,43 @@ sub render_charts_tab {
             const chartOptions = {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: { legend: { labels: { color: '#9aa0a6', boxWidth: 12, font: { size: 11 } } } },
+                interaction: {
+                    mode: 'index',
+                    intersect: false
+                },
+                plugins: {
+                    legend: { labels: { color: '#9aa0a6', boxWidth: 12, font: { size: 11 } } },
+                    tooltip: {
+                        enabled: true,
+                        mode: 'index',
+                        intersect: false,
+                        backgroundColor: 'rgba(30, 34, 42, 0.95)',
+                        titleColor: '#e8eaed',
+                        bodyColor: '#9aa0a6',
+                        borderColor: '#374151',
+                        borderWidth: 1,
+                        padding: 10,
+                        displayColors: true
+                    }
+                },
                 scales: {
-                    x: { grid: { color: '#374151' }, ticks: { color: '#9aa0a6', maxRotation: 0, maxTicksLimit: 8 } },
+                    x: {
+                        grid: { color: '#374151' },
+                        ticks: {
+                            color: '#9aa0a6',
+                            maxRotation: 45,
+                            maxTicksLimit: 8,
+                            callback: function(value, index, values) {
+                                // Extract just HH:MM from the label
+                                const label = this.getLabelForValue(value);
+                                if (label && label.length > 5) {
+                                    const parts = label.split(' ');
+                                    return parts.length > 1 ? parts[1] : label.slice(-5);
+                                }
+                                return label;
+                            }
+                        }
+                    },
                     y: { grid: { color: '#374151' }, ticks: { color: '#9aa0a6' } }
                 }
             };
