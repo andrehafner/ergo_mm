@@ -21,9 +21,24 @@ our %API_KEYS;
 # ============================================================
 # DATABASE CONNECTION
 # ============================================================
+sub get_db_password_file {
+    # Check multiple locations for the password file
+    my @paths = (
+        '/var/www/ergo_mm/cgi-bin/sql.txt',  # nginx deployment
+        '/usr/lib/cgi-bin/sql.txt',           # legacy/Apache deployment
+    );
+
+    for my $path (@paths) {
+        return $path if -f $path;
+    }
+
+    die "Can't find password file in: " . join(', ', @paths);
+}
+
 sub get_db_connection {
     # Read MySQL password from file
-    open my $fh, '<', '/usr/lib/cgi-bin/sql.txt' or die "Can't open password file: $!";
+    my $password_file = get_db_password_file();
+    open my $fh, '<', $password_file or die "Can't open password file: $!";
     my $password = do { local $/; <$fh> };
     close $fh;
     $password =~ s/^\s+//;
@@ -46,12 +61,26 @@ sub get_db_connection {
 # ============================================================
 # API KEYS LOADER
 # ============================================================
-sub load_api_keys {
-    my $config_file = '/usr/lib/cgi-bin/api_keys.conf';
+sub get_api_keys_file {
+    # Check multiple locations for the API keys file
+    my @paths = (
+        '/var/www/ergo_mm/cgi-bin/api_keys.conf',  # nginx deployment
+        '/usr/lib/cgi-bin/api_keys.conf',           # legacy/Apache deployment
+    );
 
-    unless (-f $config_file) {
-        print "API keys config file not found at $config_file\n";
-        print "Create it with your MEXC and KuCoin API keys to enable balance/order tracking.\n";
+    for my $path (@paths) {
+        return $path if -f $path;
+    }
+
+    return undef;  # Not found (optional file)
+}
+
+sub load_api_keys {
+    my $config_file = get_api_keys_file();
+
+    unless ($config_file) {
+        print "API keys config file not found.\n";
+        print "Create api_keys.conf with your MEXC and KuCoin API keys to enable balance/order tracking.\n";
         return;
     }
 

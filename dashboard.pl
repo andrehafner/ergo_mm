@@ -22,8 +22,23 @@ my $SESSION_TIMEOUT = 86400;  # 24 hours in seconds
 # ============================================================
 # DATABASE CONNECTION
 # ============================================================
+sub get_db_password_file {
+    # Check multiple locations for the password file
+    my @paths = (
+        '/var/www/ergo_mm/cgi-bin/sql.txt',  # nginx deployment
+        '/usr/lib/cgi-bin/sql.txt',           # legacy/Apache deployment
+    );
+
+    for my $path (@paths) {
+        return $path if -f $path;
+    }
+
+    die "Can't find password file in: " . join(', ', @paths);
+}
+
 sub get_db_connection {
-    open my $fh, '<', '/usr/lib/cgi-bin/sql.txt' or die "Can't open password file: $!";
+    my $password_file = get_db_password_file();
+    open my $fh, '<', $password_file or die "Can't open password file: $!";
     my $password = do { local $/; <$fh> };
     close $fh;
     $password =~ s/^\s+//;
