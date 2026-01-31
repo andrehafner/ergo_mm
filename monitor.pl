@@ -133,7 +133,8 @@ sub create_http_client {
     my $ua = LWP::UserAgent->new(
         timeout => 30,
         agent => 'ErgoMMBot/1.0',
-        ssl_opts => { verify_hostname => 0 }
+        ssl_opts => { verify_hostname => 0 },
+        local_address => '0.0.0.0'  # Force IPv4
     );
     return $ua;
 }
