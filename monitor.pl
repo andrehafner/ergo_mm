@@ -9,11 +9,17 @@ use strict;
 use warnings;
 use DBI;
 use LWP::UserAgent;
+use LWP::Protocol::https;
+use IO::Socket::SSL;
+use Socket qw(AF_INET);
 use JSON;
 use POSIX qw(strftime);
 use Time::HiRes qw(time gettimeofday);
 use Digest::SHA qw(sha256_hex hmac_sha256_hex hmac_sha256);
 use MIME::Base64;
+
+# Force IPv4 for all LWP connections
+@LWP::Protocol::http::EXTRA_SOCK_OPTS = ( Domain => AF_INET );
 
 # Global API keys (loaded from config file)
 our %API_KEYS;
