@@ -159,6 +159,13 @@ sub get_overview {
     $data{alert_counts} = \%alert_counts;
     $sth->finish();
 
+    # On-chain exchange flows (skipped gracefully if sql/add_flow_tables.sql has not been applied)
+    my $flows = do {
+        local $dbh->{PrintError} = 0;
+        eval { { summary => get_flow_summary($dbh), reserves => get_flow_reserves($dbh) } };
+    };
+    $data{flows} = $flows if $flows;
+
     $data{timestamp} = strftime("%Y-%m-%d %H:%M:%S", localtime());
 
     return \%data;
@@ -280,7 +287,7 @@ sub get_trades {
             MIN(price) as min_price,
             MAX(price) as max_price
         FROM trades
-        WHERE recorded_at > DATE_SUB(NOW(), INTERVAL ? HOUR)
+        WHERE trade_time > DATE_SUB(NOW(), INTERVAL ? HOUR)
     };
 
     if ($exchange) {
@@ -313,6 +320,138 @@ sub get_recommendations {
     return { recommendations => $data };
 }
 
+# ------------------------------------------------------------
+# On-chain exchange flows (ERG in/out of exchange wallets)
+# ------------------------------------------------------------
+sub get_flow_summary {
+    my ($dbh) = @_;
+
+    my $sth = $dbh->prepare(qq{
+        SELECT
+            exchange,
+            SUM(CASE WHEN direction = 'in'  AND tx_time > DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN amount_erg ELSE 0 END) AS in_1h,
+            SUM(CASE WHEN direction = 'out' AND tx_time > DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN amount_erg ELSE 0 END) AS out_1h,
+            SUM(CASE WHEN direction = 'in'  AND tx_time > DATE_SUB(NOW(), INTERVAL 6 HOUR) THEN amount_erg ELSE 0 END) AS in_6h,
+            SUM(CASE WHEN direction = 'out' AND tx_time > DATE_SUB(NOW(), INTERVAL 6 HOUR) THEN amount_erg ELSE 0 END) AS out_6h,
+            SUM(CASE WHEN direction = 'in'  THEN amount_erg ELSE 0 END) AS in_24h,
+            SUM(CASE WHEN direction = 'out' THEN amount_erg ELSE 0 END) AS out_24h,
+            COUNT(*) AS tx_24h,
+            MAX(tx_time) AS last_tx
+        FROM exchange_flows
+        WHERE tx_time > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        GROUP BY exchange
+    });
+    $sth->execute();
+    my %summary;
+    while (my $row = $sth->fetchrow_hashref()) {
+        foreach my $window ('1h', '6h', '24h') {
+            $row->{"in_$window"}  += 0;
+            $row->{"out_$window"} += 0;
+            $row->{"net_$window"} = $row->{"in_$window"} - $row->{"out_$window"};
+        }
+        $summary{$row->{exchange}} = $row;
+    }
+    $sth->finish();
+    return \%summary;
+}
+
+sub get_flow_reserves {
+    my ($dbh) = @_;
+
+    my $sth = $dbh->prepare(qq{
+        SELECT r.exchange, r.address, r.balance_erg, r.timestamp
+        FROM exchange_reserves r
+        INNER JOIN (
+            SELECT exchange, address, MAX(timestamp) AS max_time
+            FROM exchange_reserves
+            WHERE timestamp > DATE_SUB(NOW(), INTERVAL 1 DAY)
+            GROUP BY exchange, address
+        ) x ON r.exchange = x.exchange AND r.address = x.address AND r.timestamp = x.max_time
+        ORDER BY r.exchange, r.balance_erg DESC
+    });
+    $sth->execute();
+    my %reserves;
+    while (my $row = $sth->fetchrow_hashref()) {
+        my $ex = $reserves{$row->{exchange}} ||= { total_erg => 0, addresses => [], updated => undef };
+        $ex->{total_erg} += $row->{balance_erg};
+        push @{$ex->{addresses}}, $row;
+        $ex->{updated} = $row->{timestamp} if !defined $ex->{updated} || $row->{timestamp} gt $ex->{updated};
+    }
+    $sth->finish();
+    return \%reserves;
+}
+
+sub get_flows {
+    my ($dbh, $exchange, $hours) = @_;
+    $hours ||= 24;
+
+    my %data = (
+        summary  => get_flow_summary($dbh),
+        reserves => get_flow_reserves($dbh),
+    );
+
+    # Individual on-chain transfers
+    my $sql = qq{
+        SELECT exchange, tx_id, direction, amount_erg, amount_usd, price_usd, counterparty, block_height, tx_time
+        FROM exchange_flows
+        WHERE tx_time > DATE_SUB(NOW(), INTERVAL ? HOUR)
+    };
+    $sql .= " AND exchange = ?" if $exchange;
+    $sql .= " ORDER BY tx_time DESC LIMIT 500";
+    my $sth = $dbh->prepare($sql);
+    $exchange ? $sth->execute($hours, uc($exchange)) : $sth->execute($hours);
+    $data{transfers} = $sth->fetchall_arrayref({});
+    $sth->finish();
+
+    # The MM account's own ERG/USDT deposits and withdrawals (from the exchange account APIs)
+    $sql = qq{
+        SELECT exchange, currency, direction, transfer_id, amount, fee, status, network, address, tx_id, tx_time
+        FROM user_transfers
+        WHERE 1 = 1
+    };
+    $sql .= " AND exchange = ?" if $exchange;
+    $sql .= " ORDER BY tx_time DESC LIMIT 200";
+    $sth = $dbh->prepare($sql);
+    $exchange ? $sth->execute(uc($exchange)) : $sth->execute();
+    $data{user_transfers} = $sth->fetchall_arrayref({});
+    $sth->finish();
+
+    # Per exchange + asset: deposits / withdrawals / net over 1d, 7d, 30d (failed/cancelled excluded)
+    $sth = $dbh->prepare(qq{
+        SELECT
+            exchange,
+            currency,
+            SUM(CASE WHEN direction = 'deposit'    AND tx_time > DATE_SUB(NOW(), INTERVAL 1 DAY) THEN amount ELSE 0 END) AS in_1d,
+            SUM(CASE WHEN direction = 'withdrawal' AND tx_time > DATE_SUB(NOW(), INTERVAL 1 DAY) THEN amount ELSE 0 END) AS out_1d,
+            SUM(CASE WHEN direction = 'deposit'    AND tx_time > DATE_SUB(NOW(), INTERVAL 7 DAY) THEN amount ELSE 0 END) AS in_7d,
+            SUM(CASE WHEN direction = 'withdrawal' AND tx_time > DATE_SUB(NOW(), INTERVAL 7 DAY) THEN amount ELSE 0 END) AS out_7d,
+            SUM(CASE WHEN direction = 'deposit'    THEN amount ELSE 0 END) AS in_30d,
+            SUM(CASE WHEN direction = 'withdrawal' THEN amount ELSE 0 END) AS out_30d,
+            COUNT(*) AS tx_30d,
+            MAX(tx_time) AS last_tx
+        FROM user_transfers
+        WHERE tx_time > DATE_SUB(NOW(), INTERVAL 30 DAY)
+          AND (status IS NULL OR status NOT REGEXP 'FAIL|CANCEL|REJECT')
+        GROUP BY exchange, currency
+    });
+    $sth->execute();
+    my %account_summary;
+    while (my $row = $sth->fetchrow_hashref()) {
+        foreach my $window ('1d', '7d', '30d') {
+            $row->{"in_$window"}  += 0;
+            $row->{"out_$window"} += 0;
+            $row->{"net_$window"} = $row->{"in_$window"} - $row->{"out_$window"};
+        }
+        $account_summary{$row->{exchange}}{$row->{currency}} = $row;
+    }
+    $sth->finish();
+    $data{user_transfer_summary} = \%account_summary;
+
+    $data{hours} = $hours;
+    $data{exchange} = $exchange || 'all';
+    return \%data;
+}
+
 sub get_health {
     my ($dbh) = @_;
 
@@ -340,6 +479,12 @@ sub get_health {
     $sth->execute();
     my ($recent_count) = $sth->fetchrow_array();
     $health{monitoring_active} = $recent_count > 0 ? 1 : 0;
+    $sth->finish();
+
+    # Seconds since the newest price sample (what the dashboard's Live/Stale badge uses)
+    $sth = $dbh->prepare("SELECT TIMESTAMPDIFF(SECOND, MAX(timestamp), NOW()) FROM price_data");
+    $sth->execute();
+    ($health{data_age_seconds}) = $sth->fetchrow_array();
     $sth->finish();
 
     # Get config status
@@ -427,6 +572,14 @@ sub main {
     }
     elsif ($endpoint eq 'recommendations') {
         $data = get_recommendations($dbh);
+    }
+    elsif ($endpoint eq 'flows') {
+        $data = do { local $dbh->{PrintError} = 0; eval { get_flows($dbh, $exchange, $hours) } };
+        unless ($data) {
+            error_response("Flow tables not available - apply sql/add_flow_tables.sql ($@)", 500);
+            $dbh->disconnect();
+            return;
+        }
     }
     else {
         error_response("Unknown endpoint: $endpoint", 404);

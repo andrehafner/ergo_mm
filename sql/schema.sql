@@ -32,7 +32,13 @@ INSERT INTO config (config_key, config_value, description) VALUES
 ('alert_cooldown_minutes', '30', 'Minutes between repeat alerts of same type'),
 ('monitoring_enabled', '1', 'Enable/disable monitoring (1/0)'),
 ('kucoin_enabled', '1', 'Monitor KuCoin (1/0)'),
-('mexc_enabled', '1', 'Monitor MEXC (1/0)')
+('mexc_enabled', '1', 'Monitor MEXC (1/0)'),
+('flow_tracking_enabled', '1', 'Track on-chain ERG flows in/out of exchange wallets (1/0)'),
+('kucoin_erg_addresses', '9gNYeyfRFUipiWZ3JR1ayDMoeh28E6J7aDQosb7yrzsuGSDqzCC,9guZaxPTe4z6dYPcnKC3eiVexdHjwHz2WfgDxkTABzyHz7q9eU5,9i8Mci4ufn3Ai5pGjmMEQpPLJyuaEAXiN7f8Nc2y4tYqpzznk69,9iNt6wfxSc3DSaBVp22E7g993dwKUCvbGdHoEjxF8SRqj35oXAv', 'Comma-separated Ergo addresses of KuCoin wallets (seeded from community tracklist - verify)'),
+('mexc_erg_addresses', '', 'Comma-separated Ergo addresses of MEXC wallets (sender address of one of your MEXC withdrawals)'),
+('ergo_explorer_url', 'https://api.ergoplatform.com', 'Ergo explorer API base URL used for on-chain flow tracking'),
+('ergo_explorer_timeout', '20', 'Seconds to wait for each explorer request'),
+('flow_alert_threshold_erg', '5000', 'Single on-chain transfer (ERG) that triggers a LARGE_INFLOW/LARGE_OUTFLOW alert; 2x this as net 1h inflow triggers NET_INFLOW_HIGH')
 ON DUPLICATE KEY UPDATE config_key=config_key;
 
 -- ============================================================
@@ -93,6 +99,7 @@ CREATE TABLE IF NOT EXISTS trades (
     side VARCHAR(10),  -- 'buy' or 'sell'
     trade_time TIMESTAMP,
     recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX idx_exchange_trade (exchange, trade_id),
     INDEX idx_exchange_time (exchange, trade_time),
     INDEX idx_recorded (recorded_at)
 );
@@ -242,6 +249,69 @@ CREATE TABLE IF NOT EXISTS user_orderbook_depth (
 );
 
 -- ============================================================
+-- EXCHANGE FLOWS TABLE
+-- One row per on-chain transaction that moved ERG into ('in')
+-- or out of ('out') an exchange's tracked wallet addresses.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS exchange_flows (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    exchange VARCHAR(20) NOT NULL,
+    tx_id VARCHAR(64) NOT NULL,
+    direction VARCHAR(10) NOT NULL,          -- 'in' = deposit to exchange, 'out' = withdrawal from exchange
+    amount_erg DECIMAL(20, 9) NOT NULL,      -- net ERG moved for the exchange's whole address set
+    amount_usd DECIMAL(20, 2),               -- valued at the exchange price when recorded
+    price_usd DECIMAL(20, 8),
+    counterparty VARCHAR(128),               -- largest non-exchange address on the other side
+    block_height INT,
+    tx_time TIMESTAMP NULL,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX idx_exchange_tx (exchange, tx_id),
+    INDEX idx_exchange_time (exchange, tx_time),
+    INDEX idx_tx_time (tx_time)
+);
+
+-- ============================================================
+-- EXCHANGE RESERVES TABLE
+-- Confirmed ERG balance of each tracked exchange address,
+-- snapshotted on every monitor run.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS exchange_reserves (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    exchange VARCHAR(20) NOT NULL,
+    address VARCHAR(128) NOT NULL,
+    balance_erg DECIMAL(20, 9) NOT NULL,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_exchange_addr_time (exchange, address, timestamp),
+    INDEX idx_exchange_time (exchange, timestamp),
+    INDEX idx_timestamp (timestamp)
+);
+
+-- ============================================================
+-- USER TRANSFERS TABLE
+-- The market-maker account's own ERG and USDT deposits and
+-- withdrawals as reported by the exchange account APIs
+-- (requires api_keys.conf).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS user_transfers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    exchange VARCHAR(20) NOT NULL,
+    currency VARCHAR(10) NOT NULL DEFAULT 'ERG',   -- 'ERG' or 'USDT'
+    direction VARCHAR(12) NOT NULL,                -- 'deposit' or 'withdrawal'
+    transfer_id VARCHAR(128) NOT NULL,
+    amount DECIMAL(20, 9) NOT NULL,
+    fee DECIMAL(20, 9) DEFAULT 0,
+    status VARCHAR(30),
+    network VARCHAR(30),                           -- chain used (mainly for USDT: TRC20, ERC20, ...)
+    address VARCHAR(128),
+    tx_id VARCHAR(128),
+    tx_time TIMESTAMP NULL,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX idx_exchange_cur_dir_transfer (exchange, currency, direction, transfer_id),
+    INDEX idx_exchange_cur_time (exchange, currency, tx_time),
+    INDEX idx_tx_time (tx_time)
+);
+
+-- ============================================================
 -- VIEWS FOR DASHBOARD
 -- ============================================================
 
@@ -314,6 +384,33 @@ INNER JOIN (
     AND u1.depth_level = u2.depth_level
     AND u1.timestamp = u2.max_time;
 
+-- On-chain flow totals per exchange over the last 24h (1h/6h/24h windows)
+CREATE OR REPLACE VIEW v_exchange_flow_summary AS
+SELECT
+    exchange,
+    SUM(CASE WHEN direction = 'in'  AND tx_time > DATE_SUB(NOW(), INTERVAL 1 HOUR)  THEN amount_erg ELSE 0 END) AS in_1h,
+    SUM(CASE WHEN direction = 'out' AND tx_time > DATE_SUB(NOW(), INTERVAL 1 HOUR)  THEN amount_erg ELSE 0 END) AS out_1h,
+    SUM(CASE WHEN direction = 'in'  AND tx_time > DATE_SUB(NOW(), INTERVAL 6 HOUR)  THEN amount_erg ELSE 0 END) AS in_6h,
+    SUM(CASE WHEN direction = 'out' AND tx_time > DATE_SUB(NOW(), INTERVAL 6 HOUR)  THEN amount_erg ELSE 0 END) AS out_6h,
+    SUM(CASE WHEN direction = 'in'  THEN amount_erg ELSE 0 END) AS in_24h,
+    SUM(CASE WHEN direction = 'out' THEN amount_erg ELSE 0 END) AS out_24h,
+    COUNT(*) AS tx_24h,
+    MAX(tx_time) AS last_tx
+FROM exchange_flows
+WHERE tx_time > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+GROUP BY exchange;
+
+-- Latest confirmed balance of each tracked exchange address
+CREATE OR REPLACE VIEW v_latest_exchange_reserves AS
+SELECT r.exchange, r.address, r.balance_erg, r.timestamp
+FROM exchange_reserves r
+INNER JOIN (
+    SELECT exchange, address, MAX(timestamp) AS max_time
+    FROM exchange_reserves
+    WHERE timestamp > DATE_SUB(NOW(), INTERVAL 1 DAY)
+    GROUP BY exchange, address
+) x ON r.exchange = x.exchange AND r.address = x.address AND r.timestamp = x.max_time;
+
 -- ============================================================
 -- CLEANUP PROCEDURE
 -- Removes old data to prevent database bloat
@@ -344,6 +441,15 @@ BEGIN
 
     -- Keep 30 days of user orderbook depth
     DELETE FROM user_orderbook_depth WHERE timestamp < DATE_SUB(NOW(), INTERVAL 30 DAY);
+
+    -- Keep 90 days of on-chain exchange flows (small: one row per real transfer)
+    DELETE FROM exchange_flows WHERE tx_time < DATE_SUB(NOW(), INTERVAL 90 DAY);
+
+    -- Keep 14 days of reserve snapshots (one row per address per run)
+    DELETE FROM exchange_reserves WHERE timestamp < DATE_SUB(NOW(), INTERVAL 14 DAY);
+
+    -- Keep 1 year of the MM account's own deposit/withdrawal history
+    DELETE FROM user_transfers WHERE recorded_at < DATE_SUB(NOW(), INTERVAL 1 YEAR);
 
     -- Expire old recommendations
     UPDATE recommendations SET is_active = 0

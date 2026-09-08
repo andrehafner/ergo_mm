@@ -115,9 +115,10 @@ echo "Step 4: Setting up cron job"
 echo "----------------------------------------------"
 
 # Create cron entry - now pointing to scripts in main directory
-CRON_ENTRY="*/5 * * * * /usr/bin/perl $SCRIPT_DIR/monitor.pl >> /var/log/ergo_mm_monitor.log 2>&1"
+# Runs every minute; monitor.pl takes a lock so overlapping runs are skipped
+CRON_ENTRY="* * * * * /usr/bin/perl $SCRIPT_DIR/monitor.pl >> /var/log/ergo_mm_monitor.log 2>&1"
 
-echo "Suggested cron entry (runs every 5 minutes):"
+echo "Suggested cron entry (runs every minute):"
 echo "$CRON_ENTRY"
 echo ""
 read -p "Add to crontab? (y/n) " -n 1 -r
@@ -155,5 +156,6 @@ echo "  ?endpoint=prices       - Price history"
 echo "  ?endpoint=depth        - Orderbook depth history"
 echo "  ?endpoint=alerts       - Alert history"
 echo "  ?endpoint=trades       - Trade summary"
+echo "  ?endpoint=flows        - On-chain ERG flows in/out of exchanges"
 echo "  ?endpoint=health       - System health (no auth needed)"
 echo ""

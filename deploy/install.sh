@@ -117,6 +117,11 @@ if [ -f "${SCRIPT_DIR}/sql/add_user_tables.sql" ]; then
     mysql -u root -p"${MYSQL_ROOT_PASSWORD}" ergo_mm < "${SCRIPT_DIR}/sql/add_user_tables.sql" 2>/dev/null || true
 fi
 
+# On-chain exchange flow tables + trades de-duplication (idempotent)
+if [ -f "${SCRIPT_DIR}/sql/add_flow_tables.sql" ]; then
+    mysql -u root -p"${MYSQL_ROOT_PASSWORD}" ergo_mm < "${SCRIPT_DIR}/sql/add_flow_tables.sql" || true
+fi
+
 # Enable event scheduler for automatic cleanup
 mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "SET GLOBAL event_scheduler = ON;"
 
@@ -182,8 +187,8 @@ echo -e "${GREEN}Nginx configured${NC}"
 # ============================================================
 echo -e "${YELLOW}[8/8] Setting up monitoring cron job...${NC}"
 
-# Create cron job for monitor.pl (every 5 minutes)
-CRON_CMD="*/5 * * * * /usr/bin/perl ${CGI_DIR}/monitor.pl >> /var/log/ergo_mm/monitor.log 2>&1"
+# Create cron job for monitor.pl (every minute; the script holds a lock so runs never overlap)
+CRON_CMD="* * * * * /usr/bin/perl ${CGI_DIR}/monitor.pl >> /var/log/ergo_mm/monitor.log 2>&1"
 (crontab -l 2>/dev/null | grep -v "monitor.pl"; echo "$CRON_CMD") | crontab -
 
 # Create log file with proper permissions
@@ -208,13 +213,16 @@ echo ""
 echo "2. Setup SSL certificate (recommended):"
 echo "   sudo certbot --nginx -d ${DOMAIN}"
 echo ""
-echo "3. (Optional) Configure exchange API keys for balance tracking:"
+echo "3. (Optional) Configure exchange API keys for balance + deposit/withdrawal tracking:"
 echo "   cp ${CGI_DIR}/api_keys.conf.example ${CGI_DIR}/api_keys.conf"
 echo "   nano ${CGI_DIR}/api_keys.conf"
 echo "   chmod 600 ${CGI_DIR}/api_keys.conf"
 echo ""
 echo "4. Change the dashboard password:"
 echo "   Edit ${CGI_DIR}/dashboard.pl and change DASHBOARD_PASSWORD"
+echo ""
+echo "5. Check the exchange wallet addresses used for on-chain flow tracking:"
+echo "   Dashboard -> Settings -> On-chain Flow Tracking (KuCoin is pre-filled, MEXC needs its hot wallet)"
 echo ""
 echo "5. Monitor logs:"
 echo "   tail -f /var/log/ergo_mm/monitor.log"
