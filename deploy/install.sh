@@ -83,6 +83,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cp "${SCRIPT_DIR}/dashboard.pl" ${CGI_DIR}/
 cp "${SCRIPT_DIR}/api.pl" ${CGI_DIR}/
 cp "${SCRIPT_DIR}/monitor.pl" ${CGI_DIR}/
+cp "${SCRIPT_DIR}/check_keys.pl" ${CGI_DIR}/
 
 chmod 755 ${CGI_DIR}/*.pl
 chown -R www-data:www-data ${INSTALL_DIR}

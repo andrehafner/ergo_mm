@@ -130,12 +130,14 @@ The **Flows** tab and the "ERG On-chain Exchange Flows" card need the exchanges'
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `kucoin_erg_addresses` | 4 community-tracked KuCoin wallets | Same set ergo.watch reports. Verify: the Flows tab shows each address's live balance. |
-| `mexc_erg_addresses` | *(empty)* | MEXC's wallet is not publicly catalogued. Open one of your own MEXC ERG withdrawals on explorer.ergoplatform.com; the **sending** address is MEXC's hot wallet. |
+| `kucoin_erg_addresses` | one known KuCoin wallet | More are discovered from your own withdrawals (below). The Flows tab shows each address's live balance; the monitor log names any address the explorer rejects. |
+| `mexc_erg_addresses` | *(empty)* | MEXC's wallet is not publicly catalogued; filled in from your own withdrawals (below). |
 | `flow_alert_threshold_erg` | `5000` | Single transfer size that alerts. 2x this as net 1h inflow raises `NET_INFLOW_HIGH` (critical). |
 | `ergo_explorer_url` | `https://api.ergoplatform.com` | Point at your own explorer backend if the public one is slow. |
 | `ergo_explorer_timeout` | `20` | Seconds per explorer request. |
 | `flow_tracking_enabled` | `1` | Turn the whole feature off with `0`. |
+
+**Hot-wallet discovery.** The address that sent one of *your* ERG withdrawals is the exchange's hot wallet. With `api_keys.conf` working, the monitor looks each of your withdrawals up on the explorer once, records the sending address, prints it in the log, and **Settings → On-chain Flow Tracking** lists it under the address box with a one-click "add". That is how the MEXC address (and any further KuCoin wallets) get filled in.
 
 How a transfer is classified: for each confirmed transaction touching a tracked address, ERG spent from tracked addresses counts as leaving and ERG paid to tracked addresses counts as arriving. The net is one **in** or **out** row, so change outputs and hot-to-cold shuffles cancel out. Fee-only transactions (< 0.01 ERG) are ignored. The first run backfills 48 hours but never alerts on backfilled history.
 
@@ -297,7 +299,8 @@ ergo_mm_bot/
 ├── cgi-bin/
 │   ├── monitor.pl      # Data collection script (cron)
 │   ├── dashboard.pl    # Web dashboard
-│   └── api.pl          # JSON API endpoints
+│   ├── api.pl          # JSON API endpoints
+│   └── check_keys.pl   # Diagnostic: are the exchange API keys accepted?
 ├── sql/
 │   ├── schema.sql              # Database schema (fresh installs)
 │   ├── add_user_tables.sql     # Migration: balance / order tracking
@@ -308,6 +311,13 @@ ergo_mm_bot/
 ```
 
 ## Troubleshooting
+
+### Exchange API keys rejected (e.g. MEXC `10072 Api key info invalid`)
+```bash
+# Tries every authenticated endpoint and explains the exchange's error code
+perl /var/www/ergo_mm/cgi-bin/check_keys.pl
+```
+MEXC keys created **without** an IP whitelist expire 90 days after creation; keys bound to an IP do not. The script prints the server's public IP to whitelist. KuCoin rejects keys whose whitelist does not include the server (`400006`) or whose passphrase is wrong (`400004`).
 
 ### Monitor script not running
 ```bash

@@ -34,7 +34,7 @@ INSERT INTO config (config_key, config_value, description) VALUES
 ('kucoin_enabled', '1', 'Monitor KuCoin (1/0)'),
 ('mexc_enabled', '1', 'Monitor MEXC (1/0)'),
 ('flow_tracking_enabled', '1', 'Track on-chain ERG flows in/out of exchange wallets (1/0)'),
-('kucoin_erg_addresses', '9gNYeyfRFUipiWZ3JR1ayDMoeh28E6J7aDQosb7yrzsuGSDqzCC,9guZaxPTe4z6dYPcnKC3eiVexdHjwHz2WfgDxkTABzyHz7q9eU5,9i8Mci4ufn3Ai5pGjmMEQpPLJyuaEAXiN7f8Nc2y4tYqpzznk69,9iNt6wfxSc3DSaBVp22E7g993dwKUCvbGdHoEjxF8SRqj35oXAv', 'Comma-separated Ergo addresses of KuCoin wallets (seeded from community tracklist - verify)'),
+('kucoin_erg_addresses', '9gNYeyfRFUipiWZ3JR1ayDMoeh28E6J7aDQosb7yrzsuGSDqzCC', 'Comma-separated Ergo addresses of KuCoin wallets (more are suggested in Settings from your own withdrawals)'),
 ('mexc_erg_addresses', '', 'Comma-separated Ergo addresses of MEXC wallets (sender address of one of your MEXC withdrawals)'),
 ('ergo_explorer_url', 'https://api.ergoplatform.com', 'Ergo explorer API base URL used for on-chain flow tracking'),
 ('ergo_explorer_timeout', '20', 'Seconds to wait for each explorer request'),
@@ -309,6 +309,23 @@ CREATE TABLE IF NOT EXISTS user_transfers (
     UNIQUE INDEX idx_exchange_cur_dir_transfer (exchange, currency, direction, transfer_id),
     INDEX idx_exchange_cur_time (exchange, currency, tx_time),
     INDEX idx_tx_time (tx_time)
+);
+
+-- ============================================================
+-- EXCHANGE WALLET HINTS TABLE
+-- Hot-wallet discovery: the address that sent one of your own
+-- ERG withdrawals is the exchange's hot wallet. The monitor looks
+-- up each withdrawal tx on the explorer once and records the
+-- sending address(es) here; Settings offers them for tracking.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS exchange_wallet_hints (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    exchange VARCHAR(20) NOT NULL,
+    tx_id VARCHAR(128) NOT NULL,             -- one of your withdrawals, as reported by the exchange
+    address VARCHAR(128) NULL,               -- input address of that tx; NULL = looked up, nothing usable
+    checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX idx_exchange_tx_addr (exchange, tx_id, address),
+    INDEX idx_exchange_addr (exchange, address)
 );
 
 -- ============================================================
