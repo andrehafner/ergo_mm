@@ -126,25 +126,43 @@ ON DUPLICATE KEY UPDATE config_key = config_key;
 -- TRADES DE-DUPLICATION
 -- store_trades() relied on ON DUPLICATE KEY, but trades had no
 -- unique key, so every run re-inserted the same ~100 recent
--- trades and volume/trade-count stats were inflated. Remove the
--- duplicates, then add the unique key so it works as intended.
+-- trades and volume/trade-count stats were inflated.
+--
+-- The table is rebuilt rather than cleaned in place: a self-join
+-- DELETE is O(n^2) without the key and can run for hours on a
+-- table that has collected duplicates for months (and it locks
+-- every row, which stalls the monitor's inserts meanwhile). The
+-- rebuild copies only the last day - the retention the cleanup
+-- job enforces anyway - through the new unique key, then swaps
+-- the tables atomically. Skipped entirely once the key exists.
 -- ============================================================
-DELETE t1 FROM trades t1
-INNER JOIN trades t2
-    ON t1.exchange = t2.exchange
-   AND t1.trade_id = t2.trade_id
-   AND t1.id > t2.id;
+-- Scratch tables from an interrupted earlier run
+DROP TABLE IF EXISTS trades_dedup;
+DROP TABLE IF EXISTS trades_old;
 
 SET @idx_exists := (
     SELECT COUNT(*) FROM information_schema.statistics
     WHERE table_schema = DATABASE() AND table_name = 'trades' AND index_name = 'idx_exchange_trade'
 );
+
+SET @sql := IF(@idx_exists = 0, 'CREATE TABLE trades_dedup LIKE trades', 'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(@idx_exists = 0, 'ALTER TABLE trades_dedup ADD UNIQUE INDEX idx_exchange_trade (exchange, trade_id)', 'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 SET @sql := IF(@idx_exists = 0,
-    'ALTER TABLE trades ADD UNIQUE INDEX idx_exchange_trade (exchange, trade_id)',
-    'SELECT ''idx_exchange_trade already exists'' AS note');
-PREPARE stmt FROM @sql;
-EXECUTE stmt;
-DEALLOCATE PREPARE stmt;
+    'INSERT IGNORE INTO trades_dedup SELECT * FROM trades WHERE recorded_at > DATE_SUB(NOW(), INTERVAL 1 DAY)',
+    'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql := IF(@idx_exists = 0, 'RENAME TABLE trades TO trades_old, trades_dedup TO trades', 'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+DROP TABLE IF EXISTS trades_old;
+
+SELECT IF(@idx_exists = 0, 'trades rebuilt without duplicates (last 24h kept) and unique key added',
+                            'trades unique key already present - table untouched') AS note;
 
 -- ============================================================
 -- VIEWS
