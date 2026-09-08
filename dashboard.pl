@@ -434,6 +434,23 @@ sub get_flow_summary {
     return \%results;
 }
 
+sub get_flow_last_activity {
+    my ($dbh) = @_;
+    # Newest recorded on-chain transfer per exchange, any age - tells a dormant wallet from a quiet day
+    my $sth = $dbh->prepare(qq{
+        SELECT exchange, MAX(tx_time) AS last_tx, TIMESTAMPDIFF(DAY, MAX(tx_time), NOW()) AS days_ago
+        FROM exchange_flows
+        GROUP BY exchange
+    });
+    $sth->execute();
+    my %results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        $results{$row->{exchange}} = $row;
+    }
+    $sth->finish();
+    return \%results;
+}
+
 sub get_flow_reserves {
     my ($dbh) = @_;
     my $sth = $dbh->prepare(qq{
@@ -1896,7 +1913,7 @@ sub render_cross_exchange_strip {
 }
 
 sub render_flow_exchange_box {
-    my ($exchange, $summary, $reserve, $config, $show_addresses, $hints) = @_;
+    my ($exchange, $summary, $reserve, $config, $show_addresses, $hints, $last_activity) = @_;
     $hints ||= {};
 
     my $exchange_lower = lc($exchange);
@@ -1958,12 +1975,21 @@ sub render_flow_exchange_box {
     }
 
     my $tx_count = $summary ? ($summary->{tx_24h} || 0) : 0;
-    my $last_tx = ($summary && $summary->{last_tx}) ? $summary->{last_tx} : 'none in the last 24h';
+    my $activity_note;
+    if ($tx_count > 0) {
+        $activity_note = "$tx_count transfer" . ($tx_count == 1 ? '' : 's') . " in 24h &middot; last: $summary->{last_tx}";
+    } elsif ($last_activity && $last_activity->{last_tx}) {
+        my $days = $last_activity->{days_ago} || 0;
+        $activity_note = "no transfers in 24h &middot; last recorded on-chain activity: $last_activity->{last_tx}";
+        $activity_note .= qq{ <span style="color: var(--accent-orange);">&middot; $days days ago: these addresses look dormant, check the wallet hints in <a href="?tab=settings" style="color: var(--accent-cyan);">Settings</a></span>} if $days >= 7;
+    } else {
+        $activity_note = "no on-chain transfers recorded yet";
+    }
 
     print qq{
                 </tbody>
             </table>
-            <div class="flow-note">$tx_count transfer} . ($tx_count == 1 ? '' : 's') . qq{ in 24h &middot; last: $last_tx</div>
+            <div class="flow-note">$activity_note</div>
     };
 
     if ($show_addresses) {
@@ -1988,6 +2014,7 @@ sub render_flow_summary_card {
     my $tables_ok = defined $summary;
     my $reserves = $tables_ok ? (eval { get_flow_reserves($dbh) } || {}) : {};
     my $hints    = $tables_ok ? (eval { get_wallet_hints($dbh) } || {}) : {};
+    my $activity = $tables_ok ? (eval { get_flow_last_activity($dbh) } || {}) : {};
     my $tracking_on = !defined $config->{flow_tracking_enabled} || ($config->{flow_tracking_enabled}{value} // '1') ne '0';
 
     print qq{
@@ -2005,7 +2032,7 @@ sub render_flow_summary_card {
         print qq{<div class="setup-hint" style="margin-bottom: 14px;">On-chain flow tracking is disabled in <a href="?tab=settings">Settings</a>; the numbers below will not update.</div>} unless $tracking_on;
         print qq{<div class="flow-grid">};
         foreach my $exchange ('MEXC', 'KUCOIN') {
-            render_flow_exchange_box($exchange, $summary->{$exchange}, $reserves->{$exchange}, $config, $show_addresses, $hints);
+            render_flow_exchange_box($exchange, $summary->{$exchange}, $reserves->{$exchange}, $config, $show_addresses, $hints, $activity->{$exchange});
         }
         print qq{</div>
             <div class="flow-note">

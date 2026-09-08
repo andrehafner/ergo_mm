@@ -591,7 +591,9 @@ sub store_user_transfers {
     my $detail = '';
     if ($query_counts && @$query_counts) {
         my ($default, @windows) = @$query_counts;
-        $detail = " [exchange default query: $default" . (@windows ? "; weekly backfill windows: " . join(',', @windows) : '') . "]";
+        my ($oldest) = sort { $a <=> $b } grep { defined } map { $_->{time} } @$transfers;
+        $detail = " [exchange default query: $default" . (@windows ? "; weekly backfill windows: " . join(',', @windows) : '')
+                . ($oldest ? "; oldest " . strftime("%Y-%m-%d", localtime($oldest)) : '') . "]";
     }
     printf "  %s transfers: %d deposits/withdrawals on record (%d new)%s\n", $currency, scalar(@$transfers), $new, $detail;
 }
