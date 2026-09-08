@@ -563,8 +563,12 @@ sub fetch_kucoin_transfers {
 }
 
 sub store_user_transfers {
-    my ($dbh, $exchange, $currency, $transfers) = @_;
+    my ($dbh, $exchange, $currency, $transfers, $query_counts) = @_;
     return unless $transfers;
+
+    # Overlapping queries (default + weekly windows) can return the same transfer twice
+    my %seen;
+    $transfers = [ grep { !$seen{ ($_->{direction} // '') . '|' . ($_->{transfer_id} // '') }++ } @$transfers ];
 
     my $sth = $dbh->prepare(qq{
         INSERT INTO user_transfers
@@ -584,22 +588,39 @@ sub store_user_transfers {
     }
     $sth->finish();
 
-    printf "  %s transfers: %d deposits/withdrawals on record (%d new)\n", $currency, scalar(@$transfers), $new;
+    my $detail = '';
+    if ($query_counts && @$query_counts) {
+        my ($default, @windows) = @$query_counts;
+        $detail = " [exchange default query: $default" . (@windows ? "; weekly backfill windows: " . join(',', @windows) : '') . "]";
+    }
+    printf "  %s transfers: %d deposits/withdrawals on record (%d new)%s\n", $currency, scalar(@$transfers), $new, $detail;
 }
 
-sub has_user_transfers {
+# The 30-day backfill is done once per exchange/currency and remembered in the
+# config table (a row count would re-trigger it forever on an account with no
+# transfers, at 5 extra windows per minute).
+sub backfill_done {
     my ($dbh, $exchange, $currency) = @_;
-    my $sth = $dbh->prepare("SELECT 1 FROM user_transfers WHERE exchange = ? AND currency = ? LIMIT 1");
-    $sth->execute($exchange, $currency);
+    my $sth = $dbh->prepare("SELECT 1 FROM config WHERE config_key = ?");
+    $sth->execute("transfers_backfilled_" . lc($exchange) . "_" . lc($currency));
     my ($found) = $sth->fetchrow_array();
     $sth->finish();
     return $found ? 1 : 0;
 }
 
-# Pull the account's ERG and USDT deposits/withdrawals. Every run covers the last
-# 7 days (both exchanges cap a single query at about a week); the very first run
-# for an exchange/currency walks back 30 days in 7-day windows so the 30d summary
-# is populated straight away.
+sub mark_backfill_done {
+    my ($dbh, $exchange, $currency) = @_;
+    $dbh->do(qq{
+        INSERT INTO config (config_key, config_value, description)
+        VALUES (?, NOW(), 'Internal: 30-day deposit/withdrawal backfill completed')
+        ON DUPLICATE KEY UPDATE config_value = NOW()
+    }, undef, "transfers_backfilled_" . lc($exchange) . "_" . lc($currency));
+}
+
+# Pull the account's ERG and USDT deposits/withdrawals. Every run takes whatever
+# the exchange returns for a plain query (its own default range - the most
+# reliable answer on both venues). The first run per exchange/currency also walks
+# back 30 days in 7-day windows so the 30d summary is populated straight away.
 sub sync_user_transfers {
     my ($dbh, $ua, $exchange, $fetcher) = @_;
 
@@ -607,16 +628,26 @@ sub sync_user_transfers {
     my $week_ms = 7 * 86400 * 1000;
 
     foreach my $currency (@TRANSFER_CURRENCIES) {
-        my $windows = has_user_transfers($dbh, $exchange, $currency) ? 1 : 5;
-        my @all;
-        for my $i (0 .. $windows - 1) {
-            my $end_ms   = $now_ms - $i * $week_ms;
-            my $start_ms = $end_ms - $week_ms + 1;
-            my $batch = $fetcher->($ua, $currency, $start_ms, $end_ms);
-            last unless defined $batch;          # request failed: don't hammer the API with more windows
-            push @all, @$batch;
+        my $default = $fetcher->($ua, $currency);
+        next unless defined $default;              # request failed (already reported); nothing to store
+
+        my @all = @$default;
+        my @counts = (scalar(@$default));
+
+        unless (backfill_done($dbh, $exchange, $currency)) {
+            my $complete = 1;
+            for my $i (0 .. 4) {
+                my $end_ms   = $now_ms - $i * $week_ms;
+                my $start_ms = $end_ms - $week_ms + 1;
+                my $batch = $fetcher->($ua, $currency, $start_ms, $end_ms);
+                unless (defined $batch) { $complete = 0; last; }   # don't hammer the API; retry next run
+                push @counts, scalar(@$batch);
+                push @all, @$batch;
+            }
+            mark_backfill_done($dbh, $exchange, $currency) if $complete;
         }
-        store_user_transfers($dbh, $exchange, $currency, \@all);
+
+        store_user_transfers($dbh, $exchange, $currency, \@all, \@counts);
     }
 }
 
@@ -1058,15 +1089,34 @@ sub process_exchange_flows {
         my $offset = 0;
         for my $page (1 .. $max_pages) {
             my $txs = fetch_address_transactions($ua, $base_url, $address, $offset, $page_size);
-            last unless $txs && @$txs;
+            unless ($txs && @$txs) {
+                print "  " . substr($address, 0, 8) . "..." . substr($address, -6) . ": explorer returned no transactions on page $page\n" if $page == 1;
+                last;
+            }
 
             my $known_on_page = 0;
             my $oldest_ms;
+            my %skipped = (no_id => 0, unconfirmed => 0, internal => 0, new => 0);
 
             foreach my $tx (@$txs) {
-                my $tx_id = $tx->{id} or next;
-                next unless $tx->{inclusionHeight};              # confirmed only
-                my $ts_ms = ($tx->{timestamp} // 0) + 0;
+                my $tx_id = $tx->{id} // $tx->{txId};
+                unless ($tx_id) { $skipped{no_id}++; next; }
+
+                # Confirmed only. Unconfirmed txs normally come from a separate mempool
+                # endpoint, so only skip when the explorer explicitly says 0 confirmations
+                # or an empty inclusion height.
+                my $height = $tx->{inclusionHeight} // $tx->{height} // $tx->{settlementHeight};
+                my $confirmed = (defined $tx->{numConfirmations} && $tx->{numConfirmations} + 0 == 0) ? 0
+                              : (exists $tx->{inclusionHeight} && !$tx->{inclusionHeight})            ? 0
+                              : 1;
+                unless ($confirmed) { $skipped{unconfirmed}++; next; }
+
+                my $ts_ms = $tx->{timestamp} // $tx->{creationTimestamp} // $tx->{settlementTimestamp};
+                unless (defined $ts_ms) {
+                    warn "  explorer tx $tx_id carries no timestamp - recording it as seen now (run check_explorer.pl to inspect)\n";
+                    $ts_ms = $now_ms;
+                }
+                $ts_ms += 0;
                 $oldest_ms = $ts_ms if !defined $oldest_ms || $ts_ms < $oldest_ms;
                 next if $seen_tx{$tx_id}++;
 
@@ -1076,17 +1126,22 @@ sub process_exchange_flows {
                 if ($known) { $known_on_page++; next; }
 
                 my $flow = classify_exchange_tx($tx, \%addr_set);
-                next if $flow->{amount_erg} < $min_flow_erg;
+                if ($flow->{amount_erg} < $min_flow_erg) { $skipped{internal}++; next; }
 
                 my $amount_usd = $price_usd ? $flow->{amount_erg} * $price_usd : undef;
                 my $inserted = $insert_sth->execute(
                     $exchange, $tx_id, $flow->{direction}, $flow->{amount_erg}, $amount_usd, $price_usd,
-                    $flow->{counterparty}, $tx->{inclusionHeight}, int($ts_ms / 1000)
+                    $flow->{counterparty}, $height, int($ts_ms / 1000)
                 );
                 next unless $inserted && $inserted > 0;
 
+                $skipped{new}++;
                 push @new_flows, { %$flow, tx_id => $tx_id, tx_time_ms => $ts_ms };
             }
+
+            printf "  %s...%s: page %d returned %d txs -> %d new, %d already recorded, %d internal/fee-only, %d unconfirmed%s\n",
+                substr($address, 0, 8), substr($address, -6), $page, scalar(@$txs), $skipped{new}, $known_on_page,
+                $skipped{internal}, $skipped{unconfirmed}, ($skipped{no_id} ? ", $skipped{no_id} without an id (unexpected shape - run check_explorer.pl)" : '');
 
             last if $known_on_page > 0;
             last if @$txs < $page_size;
