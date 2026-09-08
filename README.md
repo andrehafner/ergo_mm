@@ -15,7 +15,7 @@ A comprehensive monitoring system for protecting ERGO community liquidity on KuC
   - Table of ERG **in** (deposits) and **out** (withdrawals) per exchange over 1h / 6h / 24h, with net
   - Live reserve (ERG held in the tracked wallets) and 48h charts
   - Every individual transfer with amount, USD value, counterparty and explorer link
-  - Your own deposits/withdrawals from the MEXC / KuCoin account APIs
+  - Your MM account's own ERG **and USDT** deposits/withdrawals from the MEXC / KuCoin account APIs, with a per-exchange in/out/net table over 24h, 7d and 30d
   - Alerts: `LARGE_INFLOW`, `LARGE_OUTFLOW`, `NET_INFLOW_HIGH` (+ `REDUCE_BIDS` recommendation)
 
 - **Liquidity Protection Alerts**
@@ -241,7 +241,7 @@ GET /cgi-bin/api.pl?endpoint=trades&exchange=MEXC&hours=24
 ```
 GET /cgi-bin/api.pl?endpoint=flows&exchange=KUCOIN&hours=24
 ```
-Returns `summary` (per exchange: `in_1h`, `out_1h`, `net_1h`, same for 6h/24h, `tx_24h`, `last_tx`), `reserves` (per exchange total and per-address balances), `transfers` (individual on-chain rows, newest first) and `user_transfers` (your own deposits/withdrawals from the account APIs). The `overview` endpoint also carries `flows.summary` and `flows.reserves`.
+Returns `summary` (per exchange: `in_1h`, `out_1h`, `net_1h`, same for 6h/24h, `tx_24h`, `last_tx`), `reserves` (per exchange total and per-address balances), `transfers` (individual on-chain rows, newest first), `user_transfers` (the MM account's own ERG and USDT deposits/withdrawals from the account APIs, with `currency` and `network`) and `user_transfer_summary` (per exchange and asset: `in_1d`/`out_1d`/`net_1d`, same for 7d and 30d). The `overview` endpoint also carries `flows.summary` and `flows.reserves`.
 
 ### Health Check (No Auth Required)
 ```

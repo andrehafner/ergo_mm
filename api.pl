@@ -403,18 +403,49 @@ sub get_flows {
     $data{transfers} = $sth->fetchall_arrayref({});
     $sth->finish();
 
-    # Your own deposits / withdrawals (from the exchange account APIs)
+    # The MM account's own ERG/USDT deposits and withdrawals (from the exchange account APIs)
     $sql = qq{
-        SELECT exchange, direction, transfer_id, amount_erg, fee_erg, status, address, tx_id, tx_time
+        SELECT exchange, currency, direction, transfer_id, amount, fee, status, network, address, tx_id, tx_time
         FROM user_transfers
         WHERE 1 = 1
     };
     $sql .= " AND exchange = ?" if $exchange;
-    $sql .= " ORDER BY tx_time DESC LIMIT 100";
+    $sql .= " ORDER BY tx_time DESC LIMIT 200";
     $sth = $dbh->prepare($sql);
     $exchange ? $sth->execute(uc($exchange)) : $sth->execute();
     $data{user_transfers} = $sth->fetchall_arrayref({});
     $sth->finish();
+
+    # Per exchange + asset: deposits / withdrawals / net over 1d, 7d, 30d (failed/cancelled excluded)
+    $sth = $dbh->prepare(qq{
+        SELECT
+            exchange,
+            currency,
+            SUM(CASE WHEN direction = 'deposit'    AND tx_time > DATE_SUB(NOW(), INTERVAL 1 DAY) THEN amount ELSE 0 END) AS in_1d,
+            SUM(CASE WHEN direction = 'withdrawal' AND tx_time > DATE_SUB(NOW(), INTERVAL 1 DAY) THEN amount ELSE 0 END) AS out_1d,
+            SUM(CASE WHEN direction = 'deposit'    AND tx_time > DATE_SUB(NOW(), INTERVAL 7 DAY) THEN amount ELSE 0 END) AS in_7d,
+            SUM(CASE WHEN direction = 'withdrawal' AND tx_time > DATE_SUB(NOW(), INTERVAL 7 DAY) THEN amount ELSE 0 END) AS out_7d,
+            SUM(CASE WHEN direction = 'deposit'    THEN amount ELSE 0 END) AS in_30d,
+            SUM(CASE WHEN direction = 'withdrawal' THEN amount ELSE 0 END) AS out_30d,
+            COUNT(*) AS tx_30d,
+            MAX(tx_time) AS last_tx
+        FROM user_transfers
+        WHERE tx_time > DATE_SUB(NOW(), INTERVAL 30 DAY)
+          AND (status IS NULL OR status NOT REGEXP 'FAIL|CANCEL|REJECT')
+        GROUP BY exchange, currency
+    });
+    $sth->execute();
+    my %account_summary;
+    while (my $row = $sth->fetchrow_hashref()) {
+        foreach my $window ('1d', '7d', '30d') {
+            $row->{"in_$window"}  += 0;
+            $row->{"out_$window"} += 0;
+            $row->{"net_$window"} = $row->{"in_$window"} - $row->{"out_$window"};
+        }
+        $account_summary{$row->{exchange}}{$row->{currency}} = $row;
+    }
+    $sth->finish();
+    $data{user_transfer_summary} = \%account_summary;
 
     $data{hours} = $hours;
     $data{exchange} = $exchange || 'all';

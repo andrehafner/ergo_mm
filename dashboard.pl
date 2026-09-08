@@ -530,11 +530,41 @@ sub get_reserve_history {
     return \@results;
 }
 
+sub get_user_transfer_summary {
+    my ($dbh) = @_;
+    # Deposits/withdrawals of the MM account per exchange and asset over 1d / 7d / 30d.
+    # Failed, cancelled and rejected transfers never moved funds, so they are excluded.
+    my $sth = $dbh->prepare(qq{
+        SELECT
+            exchange,
+            currency,
+            SUM(CASE WHEN direction = 'deposit'    AND tx_time > DATE_SUB(NOW(), INTERVAL 1 DAY)  THEN amount ELSE 0 END) AS in_1d,
+            SUM(CASE WHEN direction = 'withdrawal' AND tx_time > DATE_SUB(NOW(), INTERVAL 1 DAY)  THEN amount ELSE 0 END) AS out_1d,
+            SUM(CASE WHEN direction = 'deposit'    AND tx_time > DATE_SUB(NOW(), INTERVAL 7 DAY)  THEN amount ELSE 0 END) AS in_7d,
+            SUM(CASE WHEN direction = 'withdrawal' AND tx_time > DATE_SUB(NOW(), INTERVAL 7 DAY)  THEN amount ELSE 0 END) AS out_7d,
+            SUM(CASE WHEN direction = 'deposit'    THEN amount ELSE 0 END) AS in_30d,
+            SUM(CASE WHEN direction = 'withdrawal' THEN amount ELSE 0 END) AS out_30d,
+            COUNT(*) AS tx_30d,
+            MAX(tx_time) AS last_tx
+        FROM user_transfers
+        WHERE tx_time > DATE_SUB(NOW(), INTERVAL 30 DAY)
+          AND (status IS NULL OR status NOT REGEXP 'FAIL|CANCEL|REJECT')
+        GROUP BY exchange, currency
+    });
+    $sth->execute();
+    my %results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        $results{$row->{exchange}}{$row->{currency}} = $row;
+    }
+    $sth->finish();
+    return \%results;
+}
+
 sub get_user_transfers {
     my ($dbh, $limit) = @_;
     $limit ||= 50;
     my $sth = $dbh->prepare(qq{
-        SELECT exchange, direction, amount_erg, fee_erg, status, address, tx_id, tx_time
+        SELECT exchange, currency, direction, amount, fee, status, network, address, tx_id, tx_time
         FROM user_transfers
         ORDER BY tx_time DESC
         LIMIT ?
@@ -1076,6 +1106,12 @@ sub html_header {
         .flow-badge.deposit { background: rgba(34, 197, 94, 0.15); color: var(--accent-green); }
         .flow-badge.withdrawal { background: rgba(139, 92, 246, 0.15); color: var(--accent-purple); }
         .flow-note { font-size: 12px; color: var(--text-muted); margin-top: 10px; line-height: 1.5; }
+        .acct-in { color: var(--accent-green); }        /* funds you moved onto the exchange */
+        .acct-out { color: var(--accent-purple); }      /* funds you took off the exchange */
+        .acct-net-pos { color: var(--accent-green); font-weight: 600; }
+        .acct-net-neg { color: var(--accent-purple); font-weight: 600; }
+        .asset-tag { font-weight: 600; letter-spacing: .3px; }
+        .flow-table td.asset-cell { border-bottom: none; vertical-align: top; }
         .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
         .tx-link { color: var(--accent-blue); text-decoration: none; }
         .tx-link:hover { text-decoration: underline; }
@@ -1957,6 +1993,87 @@ sub render_flow_summary_card {
     print qq{</div></div>};
 }
 
+sub render_account_transfers_card {
+    my ($summary, $user_transfers) = @_;
+
+    my $have_keys_data = (keys %$summary) || @$user_transfers;
+
+    print qq{
+        <div class="card full-width">
+            <div class="card-header">
+                <div class="card-title">Your MM Account: ERG &amp; USDT In / Out</div>
+                <span class="card-badge">deposits &amp; withdrawals</span>
+            </div>
+            <div class="card-body">
+    };
+
+    unless ($have_keys_data) {
+        print qq{<div class="setup-hint">Nothing recorded for the market-maker account yet. Deposits and withdrawals are read from the MEXC and KuCoin account APIs, so <code>api_keys.conf</code> must contain read-only keys for each exchange. The first run backfills the last 30 days.</div></div></div>};
+        return;
+    }
+
+    print qq{<div class="flow-grid">};
+    foreach my $exchange ('MEXC', 'KUCOIN') {
+        my $exchange_lower = lc($exchange);
+        my $display = $exchange eq 'KUCOIN' ? 'KuCoin' : $exchange;
+        my $by_currency = $summary->{$exchange} || {};
+
+        my $last_tx = '';
+        foreach my $row (values %$by_currency) {
+            $last_tx = $row->{last_tx} if $row->{last_tx} && $row->{last_tx} gt $last_tx;
+        }
+
+        print qq{
+            <div class="flow-exchange">
+                <div class="flow-exchange-header">
+                    <div class="exchange-header" style="margin-bottom: 0;">
+                        <div class="exchange-logo $exchange_lower" style="width: 32px; height: 32px; font-size: 10px;">$exchange</div>
+                        <div class="exchange-name" style="font-size: 16px;">$display</div>
+                    </div>
+                    <div class="flow-reserve">} . ($last_tx ? "last transfer<br>$last_tx" : 'no transfers in 30 days') . qq{</div>
+                </div>
+                <table class="flow-table">
+                    <thead><tr><th>Asset</th><th>Window</th><th>Deposits (in)</th><th>Withdrawals (out)</th><th>Net</th></tr></thead>
+                    <tbody>
+        };
+
+        foreach my $currency ('ERG', 'USDT') {
+            my $row = $by_currency->{$currency} || {};
+            my $first = 1;
+            foreach my $window (['1d', '24h'], ['7d', '7d'], ['30d', '30d']) {
+                my ($key, $label) = @$window;
+                my $in  = $row->{"in_$key"}  || 0;
+                my $out = $row->{"out_$key"} || 0;
+                my $net = $in - $out;
+                my $net_class = $net > 0 ? 'acct-net-pos' : $net < 0 ? 'acct-net-neg' : '';
+                my $asset_cell = $first ? qq{<td class="asset-cell" rowspan="3"><span class="asset-tag">$currency</span></td>} : '';
+                print qq{
+                        <tr>
+                            $asset_cell
+                            <td style="text-align: left;">$label</td>
+                            <td class="acct-in">} . format_amount($in, $currency) . qq{</td>
+                            <td class="acct-out">} . format_amount($out, $currency) . qq{</td>
+                            <td class="$net_class">} . format_signed_amount($net, $currency) . qq{</td>
+                        </tr>
+                };
+                $first = 0;
+            }
+        }
+
+        print qq{
+                    </tbody>
+                </table>
+            </div>
+        };
+    }
+    print qq{</div>
+            <div class="flow-note">
+                <span class="acct-in">Deposits</span> = funds you moved onto the exchange, <span class="acct-out">withdrawals</span> = funds you took off it, so net &gt; 0 means capital was added to that venue in the window.
+                Failed, cancelled and rejected transfers are excluded. Read from the exchange account APIs every minute (7-day window; the first run backfills 30 days).
+            </div>
+        </div></div>};
+}
+
 sub render_flows_tab {
     my ($dbh, $config) = @_;
 
@@ -1969,6 +2086,7 @@ sub render_flows_tab {
     my $reserve_history = eval { get_reserve_history($dbh, 48) } || [];
     my $recent_flows    = eval { get_recent_flows($dbh, 100, 48) } || [];
     my $user_transfers  = eval { get_user_transfers($dbh, 50) } || [];
+    my $account_summary = eval { get_user_transfer_summary($dbh) } || {};
 
     # Charts: net flow per hour + reserve balance
     my (%net_by_bucket, %reserve_by_bucket);
@@ -2102,11 +2220,13 @@ sub render_flows_tab {
     }
     print qq{</div></div>};
 
-    # Your own deposits / withdrawals from the exchange account APIs
+    # The MM account's own deposits / withdrawals (ERG + USDT) from the exchange account APIs
+    render_account_transfers_card($account_summary, $user_transfers);
+
     print qq{
         <div class="card full-width">
             <div class="card-header">
-                <div class="card-title">Your ERG Deposits &amp; Withdrawals (exchange account)</div>
+                <div class="card-title">Your MM Account: Transfer History</div>
                 <span class="card-badge">} . scalar(@$user_transfers) . qq{ shown</span>
             </div>
             <div class="card-body">
@@ -2116,24 +2236,30 @@ sub render_flows_tab {
         print qq{
                 <div class="table-scroll">
                 <table class="flow-table wide">
-                    <thead><tr><th>Time</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Fee</th><th>Status</th><th>Address</th><th>Transaction</th></tr></thead>
+                    <thead><tr><th>Time</th><th>Exchange</th><th>Asset</th><th>Type</th><th>Amount</th><th>Fee</th><th>Network</th><th>Status</th><th>Address</th><th>Transaction</th></tr></thead>
                     <tbody>
         };
         foreach my $t (@$user_transfers) {
             my $type = $t->{direction} eq 'deposit' ? 'deposit' : 'withdrawal';
+            my $currency = uc($t->{currency} || 'ERG');
             my $status = escapeHTML($t->{status} || '');
+            my $network = escapeHTML($t->{network} || '-');
             my $address = $t->{address} ? escapeHTML($t->{address}) : '';
             my $tx_id = $t->{tx_id} ? escapeHTML($t->{tx_id}) : '';
-            my $tx_html = $tx_id
-                ? qq{<a class="tx-link mono" href="} . explorer_tx_url($tx_id) . qq{" target="_blank" rel="noopener">} . short_hash($tx_id, 10, 6) . qq{</a>}
-                : '<span style="color: var(--text-muted);">-</span>';
+            my $tx_html = !$tx_id ? '<span style="color: var(--text-muted);">-</span>'
+                : $currency eq 'ERG'
+                    ? qq{<a class="tx-link mono" href="} . explorer_tx_url($tx_id) . qq{" target="_blank" rel="noopener">} . short_hash($tx_id, 10, 6) . qq{</a>}
+                    : qq{<span class="mono" title="$tx_id">} . short_hash($tx_id, 10, 6) . qq{</span>};
+            my $fee_html = ($t->{fee} || 0) > 0 ? sprintf("%.4f %s", $t->{fee}, $currency) : '-';
             print qq{
                         <tr>
                             <td style="text-align: left;">} . ($t->{tx_time} || '-') . qq{</td>
                             <td style="text-align: left;">} . ($t->{exchange} eq 'KUCOIN' ? 'KuCoin' : $t->{exchange}) . qq{</td>
+                            <td style="text-align: left;"><span class="asset-tag">$currency</span></td>
                             <td style="text-align: left;"><span class="flow-badge $type">$type</span></td>
-                            <td>} . format_erg($t->{amount_erg}) . qq{ ERG</td>
-                            <td>} . sprintf("%.4f", $t->{fee_erg} || 0) . qq{</td>
+                            <td class="acct-} . ($type eq 'deposit' ? 'in' : 'out') . qq{">} . format_amount($t->{amount}, $currency) . qq{</td>
+                            <td>$fee_html</td>
+                            <td>$network</td>
                             <td>$status</td>
                             <td><span class="mono" title="$address">} . short_hash($address, 8, 6) . qq{</span></td>
                             <td>$tx_html</td>
@@ -2142,7 +2268,7 @@ sub render_flows_tab {
         }
         print qq{</tbody></table></div>};
     } else {
-        print qq{<div class="empty-state"><p>No account deposits or withdrawals recorded. This list fills in from the MEXC/KuCoin account APIs when <code>api_keys.conf</code> is configured with read-only keys.</p></div>};
+        print qq{<div class="empty-state"><p>No account deposits or withdrawals recorded yet. This list fills in from the MEXC/KuCoin account APIs when <code>api_keys.conf</code> is configured with read-only keys (the first run backfills 30 days).</p></div>};
     }
     print qq{</div></div>};
 
@@ -2649,6 +2775,25 @@ sub format_signed_erg {
     $num = 0 unless defined $num;
     my $sign = $num > 0 ? '+' : $num < 0 ? '-' : '';
     return $sign . format_erg(abs($num));
+}
+
+# Amount with its unit: "1,234 ERG" / "$2,500" (USDT shown as dollars)
+sub format_amount {
+    my ($num, $currency) = @_;
+    $num = 0 unless defined $num;
+    $currency = uc($currency || 'ERG');
+    if ($currency eq 'USDT') {
+        return '$0' if $num == 0;
+        return '$' . (abs($num) >= 1000 ? commify(sprintf("%.0f", $num)) : sprintf("%.2f", $num));
+    }
+    return format_erg($num) . " $currency";
+}
+
+sub format_signed_amount {
+    my ($num, $currency) = @_;
+    $num = 0 unless defined $num;
+    my $sign = $num > 0 ? '+' : $num < 0 ? '-' : '';
+    return $sign . format_amount(abs($num), $currency);
 }
 
 sub format_age {

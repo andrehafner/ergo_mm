@@ -16,10 +16,10 @@ KUCOIN_KEY=your_kucoin_api_key_here
 KUCOIN_SECRET=your_kucoin_api_secret_here
 KUCOIN_PASSPHRASE=your_kucoin_passphrase_here
 
-# The keys are used for: balances, open orders, and your own ERG
-# deposit/withdrawal history (shown on the Flows tab). Read-only
-# keys cover all of that; no trading or withdrawal permission is
-# ever required.
+# The keys are used for: balances, open orders, and the MM account's
+# own ERG and USDT deposit/withdrawal history (shown on the Flows
+# tab). Read-only keys cover all of that; no trading or withdrawal
+# permission is ever required.
 
 # ============================================================
 # IMPORTANT SECURITY NOTES:

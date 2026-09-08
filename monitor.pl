@@ -381,8 +381,11 @@ sub fetch_kucoin_open_orders {
 }
 
 # ============================================================
-# ACCOUNT DEPOSIT / WITHDRAWAL HISTORY (your own ERG transfers)
+# ACCOUNT DEPOSIT / WITHDRAWAL HISTORY
+# The market-maker account's own ERG and USDT transfers, from
+# the exchange account APIs.
 # ============================================================
+my @TRANSFER_CURRENCIES = ('ERG', 'USDT');
 my %MEXC_DEPOSIT_STATUS  = (1 => 'SMALL', 2 => 'TIME_DELAY', 3 => 'LARGE_DELAY', 4 => 'PENDING',
                             5 => 'SUCCESS', 6 => 'AUDITING', 7 => 'REJECTED');
 my %MEXC_WITHDRAW_STATUS = (1 => 'APPLY', 2 => 'AUDITING', 3 => 'WAIT', 4 => 'PROCESSING', 5 => 'WAIT_PACKAGING',
@@ -453,36 +456,49 @@ sub kucoin_signed_get {
     return $data->{data};
 }
 
+# Returns the account's deposits + withdrawals of one coin inside [start_ms, end_ms],
+# or undef when the request failed (so callers can stop paging).
 sub fetch_mexc_transfers {
-    my ($ua) = @_;
+    my ($ua, $currency, $start_ms, $end_ms) = @_;
     return undef unless $API_KEYS{MEXC_ACCESS_KEY} && $API_KEYS{MEXC_SECRET_KEY};
+    $currency ||= 'ERG';
+
+    my %window = (coin => $currency, limit => 1000);
+    $window{startTime} = $start_ms if $start_ms;
+    $window{endTime}   = $end_ms   if $end_ms;
 
     my @transfers;
 
-    my $deposits = mexc_signed_get($ua, '/api/v3/capital/deposit/hisrec', { coin => 'ERG', limit => 100 });
+    my $deposits = mexc_signed_get($ua, '/api/v3/capital/deposit/hisrec', { %window });
+    return undef unless defined $deposits;
     foreach my $d (@{ ref $deposits eq 'ARRAY' ? $deposits : [] }) {
         push @transfers, {
+            currency    => uc($d->{coin} || $currency),
             direction   => 'deposit',
             transfer_id => $d->{txId} || $d->{id}
-                           || sha256_hex(join('|', 'mexc-deposit', $d->{insertTime} // '', $d->{amount} // '', $d->{address} // '')),
+                           || sha256_hex(join('|', 'mexc-deposit', $currency, $d->{insertTime} // '', $d->{amount} // '', $d->{address} // '')),
             amount      => ($d->{amount} // 0) + 0,
             fee         => 0,
             status      => $MEXC_DEPOSIT_STATUS{$d->{status} // ''} // ($d->{status} // 'UNKNOWN'),
+            network     => $d->{network},
             address     => $d->{address},
             tx_id       => $d->{txId},
             time        => to_epoch_seconds($d->{insertTime}),
         };
     }
 
-    my $withdrawals = mexc_signed_get($ua, '/api/v3/capital/withdraw/history', { coin => 'ERG', limit => 100 });
+    my $withdrawals = mexc_signed_get($ua, '/api/v3/capital/withdraw/history', { %window });
+    return undef unless defined $withdrawals;
     foreach my $w (@{ ref $withdrawals eq 'ARRAY' ? $withdrawals : [] }) {
         push @transfers, {
+            currency    => uc($w->{coin} || $currency),
             direction   => 'withdrawal',
             transfer_id => $w->{id} || $w->{txId}
-                           || sha256_hex(join('|', 'mexc-withdrawal', $w->{applyTime} // '', $w->{amount} // '', $w->{address} // '')),
+                           || sha256_hex(join('|', 'mexc-withdrawal', $currency, $w->{applyTime} // '', $w->{amount} // '', $w->{address} // '')),
             amount      => ($w->{amount} // 0) + 0,
             fee         => ($w->{transactionFee} // 0) + 0,
             status      => $MEXC_WITHDRAW_STATUS{$w->{status} // ''} // ($w->{status} // 'UNKNOWN'),
+            network     => $w->{network},
             address     => $w->{address},
             tx_id       => $w->{txId},
             time        => to_epoch_seconds($w->{applyTime}),
@@ -493,39 +509,52 @@ sub fetch_mexc_transfers {
 }
 
 sub fetch_kucoin_transfers {
-    my ($ua) = @_;
+    my ($ua, $currency, $start_ms, $end_ms) = @_;
     return undef unless $API_KEYS{KUCOIN_KEY} && $API_KEYS{KUCOIN_SECRET} && $API_KEYS{KUCOIN_PASSPHRASE};
+    $currency ||= 'ERG';
+
+    my $window = "currency=$currency&pageSize=500";
+    $window .= "&startAt=$start_ms" if $start_ms;
+    $window .= "&endAt=$end_ms"     if $end_ms;
 
     my @transfers;
 
-    my $deposits = kucoin_signed_get($ua, '/api/v1/deposits?currency=ERG&pageSize=100');
-    foreach my $d (@{ ($deposits && ref $deposits->{items} eq 'ARRAY') ? $deposits->{items} : [] }) {
+    my $deposits = kucoin_signed_get($ua, "/api/v1/deposits?$window");
+    return undef unless defined $deposits;
+    foreach my $d (@{ ref $deposits->{items} eq 'ARRAY' ? $deposits->{items} : [] }) {
         my $wallet_tx = $d->{walletTxId} // '';
+        my ($wallet_tx_hash) = split /@/, $wallet_tx;   # KuCoin reports 'txid@outputIndex'; undef when empty
         push @transfers, {
+            currency    => uc($d->{currency} || $currency),
             direction   => 'deposit',
             transfer_id => $wallet_tx
-                           || sha256_hex(join('|', 'kucoin-deposit', $d->{createdAt} // '', $d->{amount} // '', $d->{address} // '')),
+                           || sha256_hex(join('|', 'kucoin-deposit', $currency, $d->{createdAt} // '', $d->{amount} // '', $d->{address} // '')),
             amount      => ($d->{amount} // 0) + 0,
             fee         => ($d->{fee} // 0) + 0,
             status      => $d->{status} // 'UNKNOWN',
+            network     => $d->{chain},
             address     => $d->{address},
-            tx_id       => (split /@/, $wallet_tx)[0],
+            tx_id       => $wallet_tx_hash,
             time        => to_epoch_seconds($d->{createdAt}),
         };
     }
 
-    my $withdrawals = kucoin_signed_get($ua, '/api/v1/withdrawals?currency=ERG&pageSize=100');
-    foreach my $w (@{ ($withdrawals && ref $withdrawals->{items} eq 'ARRAY') ? $withdrawals->{items} : [] }) {
+    my $withdrawals = kucoin_signed_get($ua, "/api/v1/withdrawals?$window");
+    return undef unless defined $withdrawals;
+    foreach my $w (@{ ref $withdrawals->{items} eq 'ARRAY' ? $withdrawals->{items} : [] }) {
         my $wallet_tx = $w->{walletTxId} // '';
+        my ($wallet_tx_hash) = split /@/, $wallet_tx;
         push @transfers, {
+            currency    => uc($w->{currency} || $currency),
             direction   => 'withdrawal',
             transfer_id => $w->{id} || $wallet_tx
-                           || sha256_hex(join('|', 'kucoin-withdrawal', $w->{createdAt} // '', $w->{amount} // '', $w->{address} // '')),
+                           || sha256_hex(join('|', 'kucoin-withdrawal', $currency, $w->{createdAt} // '', $w->{amount} // '', $w->{address} // '')),
             amount      => ($w->{amount} // 0) + 0,
             fee         => ($w->{fee} // 0) + 0,
             status      => $w->{status} // 'UNKNOWN',
+            network     => $w->{chain},
             address     => $w->{address},
-            tx_id       => (split /@/, $wallet_tx)[0],
+            tx_id       => $wallet_tx_hash,
             time        => to_epoch_seconds($w->{createdAt}),
         };
     }
@@ -534,27 +563,61 @@ sub fetch_kucoin_transfers {
 }
 
 sub store_user_transfers {
-    my ($dbh, $exchange, $transfers) = @_;
+    my ($dbh, $exchange, $currency, $transfers) = @_;
     return unless $transfers;
 
     my $sth = $dbh->prepare(qq{
         INSERT INTO user_transfers
-        (exchange, direction, transfer_id, amount_erg, fee_erg, status, address, tx_id, tx_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?))
-        ON DUPLICATE KEY UPDATE status = VALUES(status), tx_id = VALUES(tx_id), tx_time = VALUES(tx_time)
+        (exchange, currency, direction, transfer_id, amount, fee, status, network, address, tx_id, tx_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?))
+        ON DUPLICATE KEY UPDATE status = VALUES(status), tx_id = VALUES(tx_id), tx_time = VALUES(tx_time),
+                                network = VALUES(network)
     });
 
     my $new = 0;
     foreach my $t (@$transfers) {
         my $rows = $sth->execute(
-            $exchange, $t->{direction}, $t->{transfer_id}, $t->{amount}, $t->{fee},
-            $t->{status}, $t->{address}, $t->{tx_id}, $t->{time}
+            $exchange, $t->{currency} || $currency, $t->{direction}, $t->{transfer_id}, $t->{amount}, $t->{fee},
+            $t->{status}, $t->{network}, $t->{address}, $t->{tx_id}, $t->{time}
         );
         $new++ if $rows && $rows == 1;   # MySQL: 1 = inserted, 2 = updated, 0 = unchanged
     }
     $sth->finish();
 
-    printf "  Transfers: %d deposits/withdrawals on record (%d new)\n", scalar(@$transfers), $new;
+    printf "  %s transfers: %d deposits/withdrawals on record (%d new)\n", $currency, scalar(@$transfers), $new;
+}
+
+sub has_user_transfers {
+    my ($dbh, $exchange, $currency) = @_;
+    my $sth = $dbh->prepare("SELECT 1 FROM user_transfers WHERE exchange = ? AND currency = ? LIMIT 1");
+    $sth->execute($exchange, $currency);
+    my ($found) = $sth->fetchrow_array();
+    $sth->finish();
+    return $found ? 1 : 0;
+}
+
+# Pull the account's ERG and USDT deposits/withdrawals. Every run covers the last
+# 7 days (both exchanges cap a single query at about a week); the very first run
+# for an exchange/currency walks back 30 days in 7-day windows so the 30d summary
+# is populated straight away.
+sub sync_user_transfers {
+    my ($dbh, $ua, $exchange, $fetcher) = @_;
+
+    my $now_ms  = int(time * 1000);
+    my $week_ms = 7 * 86400 * 1000;
+
+    foreach my $currency (@TRANSFER_CURRENCIES) {
+        my $windows = has_user_transfers($dbh, $exchange, $currency) ? 1 : 5;
+        my @all;
+        for my $i (0 .. $windows - 1) {
+            my $end_ms   = $now_ms - $i * $week_ms;
+            my $start_ms = $end_ms - $week_ms + 1;
+            my $batch = $fetcher->($ua, $currency, $start_ms, $end_ms);
+            last unless defined $batch;          # request failed: don't hammer the API with more windows
+            push @all, @$batch;
+        }
+        store_user_transfers($dbh, $exchange, $currency, \@all);
+    }
 }
 
 # ============================================================
@@ -1544,10 +1607,10 @@ sub process_mexc {
             store_user_depth($dbh, 'MEXC', $user_orders, $mid_price, \%depth_data);
         }
 
-        my $transfers = fetch_mexc_transfers($ua);
-        if ($transfers) {
-            { local $dbh->{PrintError} = 0; eval { store_user_transfers($dbh, 'MEXC', $transfers) }; }
-            warn "Could not store MEXC transfers (has sql/add_flow_tables.sql been applied?): $@" if $@;
+        {
+            local $dbh->{PrintError} = 0;
+            eval { sync_user_transfers($dbh, $ua, 'MEXC', \&fetch_mexc_transfers) };
+            warn "Could not sync MEXC deposits/withdrawals (has sql/add_flow_tables.sql been applied?): $@" if $@;
         }
     }
 
@@ -1645,10 +1708,10 @@ sub process_kucoin {
             store_user_depth($dbh, 'KUCOIN', $user_orders, $mid_price, \%depth_data);
         }
 
-        my $transfers = fetch_kucoin_transfers($ua);
-        if ($transfers) {
-            { local $dbh->{PrintError} = 0; eval { store_user_transfers($dbh, 'KUCOIN', $transfers) }; }
-            warn "Could not store KuCoin transfers (has sql/add_flow_tables.sql been applied?): $@" if $@;
+        {
+            local $dbh->{PrintError} = 0;
+            eval { sync_user_transfers($dbh, $ua, 'KUCOIN', \&fetch_kucoin_transfers) };
+            warn "Could not sync KuCoin deposits/withdrawals (has sql/add_flow_tables.sql been applied?): $@" if $@;
         }
     }
 

@@ -50,25 +50,58 @@ CREATE TABLE IF NOT EXISTS exchange_reserves (
 
 -- ============================================================
 -- USER TRANSFERS TABLE
--- Your own ERG deposits/withdrawals as reported by the
--- exchange account APIs (requires api_keys.conf).
+-- The market-maker account's own ERG and USDT deposits and
+-- withdrawals as reported by the exchange account APIs
+-- (requires api_keys.conf).
 -- ============================================================
 CREATE TABLE IF NOT EXISTS user_transfers (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     exchange VARCHAR(20) NOT NULL,
-    direction VARCHAR(12) NOT NULL,          -- 'deposit' or 'withdrawal'
+    currency VARCHAR(10) NOT NULL DEFAULT 'ERG',   -- 'ERG' or 'USDT'
+    direction VARCHAR(12) NOT NULL,                -- 'deposit' or 'withdrawal'
     transfer_id VARCHAR(128) NOT NULL,
-    amount_erg DECIMAL(20, 9) NOT NULL,
-    fee_erg DECIMAL(20, 9) DEFAULT 0,
+    amount DECIMAL(20, 9) NOT NULL,
+    fee DECIMAL(20, 9) DEFAULT 0,
     status VARCHAR(30),
+    network VARCHAR(30),                           -- chain used (mainly for USDT: TRC20, ERC20, ...)
     address VARCHAR(128),
     tx_id VARCHAR(128),
     tx_time TIMESTAMP NULL,
     recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE INDEX idx_exchange_dir_transfer (exchange, direction, transfer_id),
-    INDEX idx_exchange_time (exchange, tx_time),
+    UNIQUE INDEX idx_exchange_cur_dir_transfer (exchange, currency, direction, transfer_id),
+    INDEX idx_exchange_cur_time (exchange, currency, tx_time),
     INDEX idx_tx_time (tx_time)
 );
+
+-- Upgrade a user_transfers table created by the earlier ERG-only revision of
+-- this migration (amount_erg/fee_erg, no currency/network). No-ops otherwise.
+SET @has_amount_erg := (
+    SELECT COUNT(*) FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = 'user_transfers' AND column_name = 'amount_erg'
+);
+SET @sql := IF(@has_amount_erg > 0,
+    'ALTER TABLE user_transfers CHANGE COLUMN amount_erg amount DECIMAL(20, 9) NOT NULL, CHANGE COLUMN fee_erg fee DECIMAL(20, 9) DEFAULT 0',
+    'SELECT ''user_transfers already uses amount/fee'' AS note');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @has_currency := (
+    SELECT COUNT(*) FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = 'user_transfers' AND column_name = 'currency'
+);
+SET @sql := IF(@has_currency = 0,
+    'ALTER TABLE user_transfers ADD COLUMN currency VARCHAR(10) NOT NULL DEFAULT ''ERG'' AFTER exchange, ADD COLUMN network VARCHAR(30) NULL AFTER status',
+    'SELECT ''user_transfers already has currency/network'' AS note');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @has_old_idx := (
+    SELECT COUNT(*) FROM information_schema.statistics
+    WHERE table_schema = DATABASE() AND table_name = 'user_transfers' AND index_name = 'idx_exchange_dir_transfer'
+);
+SET @sql := IF(@has_old_idx > 0,
+    'ALTER TABLE user_transfers DROP INDEX idx_exchange_dir_transfer, DROP INDEX idx_exchange_time, ADD UNIQUE INDEX idx_exchange_cur_dir_transfer (exchange, currency, direction, transfer_id), ADD INDEX idx_exchange_cur_time (exchange, currency, tx_time)',
+    'SELECT ''user_transfers indexes already current'' AS note');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 
 -- ============================================================
 -- NEW CONFIG KEYS
@@ -178,7 +211,7 @@ BEGIN
     -- Keep 14 days of reserve snapshots (one row per address per run)
     DELETE FROM exchange_reserves WHERE timestamp < DATE_SUB(NOW(), INTERVAL 14 DAY);
 
-    -- Keep 1 year of your own deposit/withdrawal history
+    -- Keep 1 year of the MM account's own deposit/withdrawal history
     DELETE FROM user_transfers WHERE recorded_at < DATE_SUB(NOW(), INTERVAL 1 YEAR);
 
     -- Expire old recommendations

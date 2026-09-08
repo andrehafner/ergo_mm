@@ -288,23 +288,26 @@ CREATE TABLE IF NOT EXISTS exchange_reserves (
 
 -- ============================================================
 -- USER TRANSFERS TABLE
--- Your own ERG deposits/withdrawals as reported by the
--- exchange account APIs (requires api_keys.conf).
+-- The market-maker account's own ERG and USDT deposits and
+-- withdrawals as reported by the exchange account APIs
+-- (requires api_keys.conf).
 -- ============================================================
 CREATE TABLE IF NOT EXISTS user_transfers (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     exchange VARCHAR(20) NOT NULL,
-    direction VARCHAR(12) NOT NULL,          -- 'deposit' or 'withdrawal'
+    currency VARCHAR(10) NOT NULL DEFAULT 'ERG',   -- 'ERG' or 'USDT'
+    direction VARCHAR(12) NOT NULL,                -- 'deposit' or 'withdrawal'
     transfer_id VARCHAR(128) NOT NULL,
-    amount_erg DECIMAL(20, 9) NOT NULL,
-    fee_erg DECIMAL(20, 9) DEFAULT 0,
+    amount DECIMAL(20, 9) NOT NULL,
+    fee DECIMAL(20, 9) DEFAULT 0,
     status VARCHAR(30),
+    network VARCHAR(30),                           -- chain used (mainly for USDT: TRC20, ERC20, ...)
     address VARCHAR(128),
     tx_id VARCHAR(128),
     tx_time TIMESTAMP NULL,
     recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE INDEX idx_exchange_dir_transfer (exchange, direction, transfer_id),
-    INDEX idx_exchange_time (exchange, tx_time),
+    UNIQUE INDEX idx_exchange_cur_dir_transfer (exchange, currency, direction, transfer_id),
+    INDEX idx_exchange_cur_time (exchange, currency, tx_time),
     INDEX idx_tx_time (tx_time)
 );
 
@@ -445,7 +448,7 @@ BEGIN
     -- Keep 14 days of reserve snapshots (one row per address per run)
     DELETE FROM exchange_reserves WHERE timestamp < DATE_SUB(NOW(), INTERVAL 14 DAY);
 
-    -- Keep 1 year of your own deposit/withdrawal history
+    -- Keep 1 year of the MM account's own deposit/withdrawal history
     DELETE FROM user_transfers WHERE recorded_at < DATE_SUB(NOW(), INTERVAL 1 YEAR);
 
     -- Expire old recommendations
