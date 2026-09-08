@@ -300,7 +300,8 @@ ergo_mm_bot/
 │   ├── monitor.pl      # Data collection script (cron)
 │   ├── dashboard.pl    # Web dashboard
 │   ├── api.pl          # JSON API endpoints
-│   └── check_keys.pl   # Diagnostic: are the exchange API keys accepted?
+│   ├── check_keys.pl   # Diagnostic: are the exchange API keys accepted?
+│   └── check_explorer.pl # Diagnostic: what does the explorer return for an address?
 ├── sql/
 │   ├── schema.sql              # Database schema (fresh installs)
 │   ├── add_user_tables.sql     # Migration: balance / order tracking
@@ -318,6 +319,13 @@ ergo_mm_bot/
 perl /var/www/ergo_mm/cgi-bin/check_keys.pl
 ```
 MEXC keys created **without** an IP whitelist expire 90 days after creation; keys bound to an IP do not. The script prints the server's public IP to whitelist. KuCoin rejects keys whose whitelist does not include the server (`400006`) or whose passphrase is wrong (`400004`).
+
+### Flows tab empty for an address that has activity
+```bash
+# Prints the explorer's raw reply for the address and how monitor.pl classifies each tx
+perl /var/www/ergo_mm/cgi-bin/check_explorer.pl 9gNYeyfRFUipiWZ3JR1ayDMoeh28E6J7aDQosb7yrzsuGSDqzCC
+```
+The monitor log also prints one line per tracked address and run: how many transactions the explorer returned and how many were new, already recorded, internal or unconfirmed.
 
 ### Monitor script not running
 ```bash
