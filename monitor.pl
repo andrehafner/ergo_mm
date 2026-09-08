@@ -14,6 +14,12 @@ use POSIX qw(strftime);
 use Time::HiRes qw(time gettimeofday);
 use Digest::SHA qw(sha256_hex hmac_sha256_hex hmac_sha256);
 use MIME::Base64;
+use Time::Local qw(timegm);
+use Fcntl qw(:flock);
+
+# Prevent overlapping runs when cron fires every minute and a run overruns
+my $LOCK_FILE = '/tmp/ergo_mm_monitor.lock';
+my $NANOERG = 1_000_000_000;
 
 # Global API keys (loaded from config file)
 our %API_KEYS;
@@ -130,8 +136,9 @@ sub load_config {
 # HTTP CLIENT
 # ============================================================
 sub create_http_client {
+    my ($timeout) = @_;
     my $ua = LWP::UserAgent->new(
-        timeout => 30,
+        timeout => $timeout || 30,
         agent => 'ErgoMMBot/1.0',
         ssl_opts => { verify_hostname => 0 },
         local_address => '0.0.0.0'  # Force IPv4
@@ -371,6 +378,183 @@ sub fetch_kucoin_open_orders {
     }
     warn "KuCoin open orders fetch failed: " . $response->status_line . " - " . $response->decoded_content;
     return undef;
+}
+
+# ============================================================
+# ACCOUNT DEPOSIT / WITHDRAWAL HISTORY (your own ERG transfers)
+# ============================================================
+my %MEXC_DEPOSIT_STATUS  = (1 => 'SMALL', 2 => 'TIME_DELAY', 3 => 'LARGE_DELAY', 4 => 'PENDING',
+                            5 => 'SUCCESS', 6 => 'AUDITING', 7 => 'REJECTED');
+my %MEXC_WITHDRAW_STATUS = (1 => 'APPLY', 2 => 'AUDITING', 3 => 'WAIT', 4 => 'PROCESSING', 5 => 'WAIT_PACKAGING',
+                            6 => 'WAIT_CONFIRM', 7 => 'SUCCESS', 8 => 'FAILED', 9 => 'CANCEL', 10 => 'MANUAL');
+
+# Accepts epoch seconds, epoch milliseconds or 'YYYY-MM-DD HH:MM:SS' and returns epoch seconds
+sub to_epoch_seconds {
+    my ($value) = @_;
+    return undef unless defined $value && length $value;
+    if ($value =~ /^\d+(\.\d+)?$/) {
+        return $value > 100_000_000_000 ? int($value / 1000) : int($value);
+    }
+    if ($value =~ /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/) {
+        my $t = eval { timegm($6, $5, $4, $3, $2 - 1, $1) };
+        return $t;
+    }
+    return undef;
+}
+
+sub mexc_signed_get {
+    my ($ua, $path, $params) = @_;
+    return undef unless $API_KEYS{MEXC_ACCESS_KEY} && $API_KEYS{MEXC_SECRET_KEY};
+
+    $params ||= {};
+    $params->{timestamp} = int(time * 1000);
+    my ($query_string, $signature) = mexc_sign_request($params);
+
+    my $response = $ua->get("https://api.mexc.com$path?$query_string&signature=$signature",
+        'X-MEXC-APIKEY' => $API_KEYS{MEXC_ACCESS_KEY});
+
+    unless ($response->is_success) {
+        warn "MEXC $path failed: " . $response->status_line . " - " . $response->decoded_content . "\n";
+        return undef;
+    }
+    my $data = eval { decode_json($response->decoded_content) };
+    if ($@) {
+        warn "MEXC $path returned invalid JSON: $@";
+        return undef;
+    }
+    return $data;
+}
+
+sub kucoin_signed_get {
+    my ($ua, $endpoint) = @_;
+    return undef unless $API_KEYS{KUCOIN_KEY} && $API_KEYS{KUCOIN_SECRET} && $API_KEYS{KUCOIN_PASSPHRASE};
+
+    my $timestamp = int(time * 1000);
+    my ($signature, $passphrase) = kucoin_sign_request($timestamp, 'GET', $endpoint);
+
+    my $response = $ua->get(
+        "https://api.kucoin.com$endpoint",
+        'KC-API-KEY' => $API_KEYS{KUCOIN_KEY},
+        'KC-API-SIGN' => $signature,
+        'KC-API-TIMESTAMP' => $timestamp,
+        'KC-API-PASSPHRASE' => $passphrase,
+        'KC-API-KEY-VERSION' => '2'
+    );
+
+    unless ($response->is_success) {
+        warn "KuCoin $endpoint failed: " . $response->status_line . " - " . $response->decoded_content . "\n";
+        return undef;
+    }
+    my $data = eval { decode_json($response->decoded_content) };
+    if ($@ || !$data || ($data->{code} // '') ne '200000') {
+        warn "KuCoin $endpoint error: " . ($data && $data->{msg} ? $data->{msg} : ($@ || 'unknown')) . "\n";
+        return undef;
+    }
+    return $data->{data};
+}
+
+sub fetch_mexc_transfers {
+    my ($ua) = @_;
+    return undef unless $API_KEYS{MEXC_ACCESS_KEY} && $API_KEYS{MEXC_SECRET_KEY};
+
+    my @transfers;
+
+    my $deposits = mexc_signed_get($ua, '/api/v3/capital/deposit/hisrec', { coin => 'ERG', limit => 100 });
+    foreach my $d (@{ ref $deposits eq 'ARRAY' ? $deposits : [] }) {
+        push @transfers, {
+            direction   => 'deposit',
+            transfer_id => $d->{txId} || $d->{id}
+                           || sha256_hex(join('|', 'mexc-deposit', $d->{insertTime} // '', $d->{amount} // '', $d->{address} // '')),
+            amount      => ($d->{amount} // 0) + 0,
+            fee         => 0,
+            status      => $MEXC_DEPOSIT_STATUS{$d->{status} // ''} // ($d->{status} // 'UNKNOWN'),
+            address     => $d->{address},
+            tx_id       => $d->{txId},
+            time        => to_epoch_seconds($d->{insertTime}),
+        };
+    }
+
+    my $withdrawals = mexc_signed_get($ua, '/api/v3/capital/withdraw/history', { coin => 'ERG', limit => 100 });
+    foreach my $w (@{ ref $withdrawals eq 'ARRAY' ? $withdrawals : [] }) {
+        push @transfers, {
+            direction   => 'withdrawal',
+            transfer_id => $w->{id} || $w->{txId}
+                           || sha256_hex(join('|', 'mexc-withdrawal', $w->{applyTime} // '', $w->{amount} // '', $w->{address} // '')),
+            amount      => ($w->{amount} // 0) + 0,
+            fee         => ($w->{transactionFee} // 0) + 0,
+            status      => $MEXC_WITHDRAW_STATUS{$w->{status} // ''} // ($w->{status} // 'UNKNOWN'),
+            address     => $w->{address},
+            tx_id       => $w->{txId},
+            time        => to_epoch_seconds($w->{applyTime}),
+        };
+    }
+
+    return \@transfers;
+}
+
+sub fetch_kucoin_transfers {
+    my ($ua) = @_;
+    return undef unless $API_KEYS{KUCOIN_KEY} && $API_KEYS{KUCOIN_SECRET} && $API_KEYS{KUCOIN_PASSPHRASE};
+
+    my @transfers;
+
+    my $deposits = kucoin_signed_get($ua, '/api/v1/deposits?currency=ERG&pageSize=100');
+    foreach my $d (@{ ($deposits && ref $deposits->{items} eq 'ARRAY') ? $deposits->{items} : [] }) {
+        my $wallet_tx = $d->{walletTxId} // '';
+        push @transfers, {
+            direction   => 'deposit',
+            transfer_id => $wallet_tx
+                           || sha256_hex(join('|', 'kucoin-deposit', $d->{createdAt} // '', $d->{amount} // '', $d->{address} // '')),
+            amount      => ($d->{amount} // 0) + 0,
+            fee         => ($d->{fee} // 0) + 0,
+            status      => $d->{status} // 'UNKNOWN',
+            address     => $d->{address},
+            tx_id       => (split /@/, $wallet_tx)[0],
+            time        => to_epoch_seconds($d->{createdAt}),
+        };
+    }
+
+    my $withdrawals = kucoin_signed_get($ua, '/api/v1/withdrawals?currency=ERG&pageSize=100');
+    foreach my $w (@{ ($withdrawals && ref $withdrawals->{items} eq 'ARRAY') ? $withdrawals->{items} : [] }) {
+        my $wallet_tx = $w->{walletTxId} // '';
+        push @transfers, {
+            direction   => 'withdrawal',
+            transfer_id => $w->{id} || $wallet_tx
+                           || sha256_hex(join('|', 'kucoin-withdrawal', $w->{createdAt} // '', $w->{amount} // '', $w->{address} // '')),
+            amount      => ($w->{amount} // 0) + 0,
+            fee         => ($w->{fee} // 0) + 0,
+            status      => $w->{status} // 'UNKNOWN',
+            address     => $w->{address},
+            tx_id       => (split /@/, $wallet_tx)[0],
+            time        => to_epoch_seconds($w->{createdAt}),
+        };
+    }
+
+    return \@transfers;
+}
+
+sub store_user_transfers {
+    my ($dbh, $exchange, $transfers) = @_;
+    return unless $transfers;
+
+    my $sth = $dbh->prepare(qq{
+        INSERT INTO user_transfers
+        (exchange, direction, transfer_id, amount_erg, fee_erg, status, address, tx_id, tx_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?))
+        ON DUPLICATE KEY UPDATE status = VALUES(status), tx_id = VALUES(tx_id), tx_time = VALUES(tx_time)
+    });
+
+    my $new = 0;
+    foreach my $t (@$transfers) {
+        my $rows = $sth->execute(
+            $exchange, $t->{direction}, $t->{transfer_id}, $t->{amount}, $t->{fee},
+            $t->{status}, $t->{address}, $t->{tx_id}, $t->{time}
+        );
+        $new++ if $rows && $rows == 1;   # MySQL: 1 = inserted, 2 = updated, 0 = unchanged
+    }
+    $sth->finish();
+
+    printf "  Transfers: %d deposits/withdrawals on record (%d new)\n", scalar(@$transfers), $new;
 }
 
 # ============================================================
@@ -662,12 +846,279 @@ sub store_user_depth {
 }
 
 # ============================================================
+# ON-CHAIN EXCHANGE FLOW TRACKING (Ergo explorer API)
+# Watches the exchanges' known ERG wallet addresses and records
+# every confirmed transaction that moved ERG in or out of them.
+# ============================================================
+sub parse_address_list {
+    my ($text) = @_;
+    return () unless defined $text;
+    my %seen;
+    my @addresses;
+    foreach my $candidate (split /[\s,;]+/, $text) {
+        next unless length $candidate;
+        # Ergo addresses are base58 (no 0, O, I, l); reject anything else so it never reaches a URL
+        next unless $candidate =~ /^[1-9A-HJ-NP-Za-km-z]{20,120}$/;
+        push @addresses, $candidate unless $seen{$candidate}++;
+    }
+    return @addresses;
+}
+
+sub explorer_get {
+    my ($ua, $base_url, $path) = @_;
+    my $response = $ua->get("$base_url$path", 'Accept' => 'application/json');
+    unless ($response->is_success) {
+        warn "Explorer request failed ($path): " . $response->status_line . "\n";
+        return undef;
+    }
+    my $data = eval { decode_json($response->decoded_content) };
+    if ($@) {
+        warn "Explorer returned invalid JSON ($path): $@";
+        return undef;
+    }
+    return $data;
+}
+
+sub fetch_address_balance_erg {
+    my ($ua, $base_url, $address) = @_;
+    my $data = explorer_get($ua, $base_url, "/api/v1/addresses/$address/balance/confirmed");
+    return undef unless $data && ref $data eq 'HASH' && defined $data->{nanoErgs};
+    return $data->{nanoErgs} / $NANOERG;
+}
+
+sub fetch_address_transactions {
+    my ($ua, $base_url, $address, $offset, $limit) = @_;
+    my $data = explorer_get($ua, $base_url, "/api/v1/addresses/$address/transactions?offset=$offset&limit=$limit");
+    return undef unless $data && ref $data eq 'HASH';
+    return ref $data->{items} eq 'ARRAY' ? $data->{items} : [];
+}
+
+# Net ERG that one transaction moved into (+) or out of (-) the exchange's
+# whole address set. Inputs spent from exchange addresses count as leaving,
+# outputs paid to exchange addresses count as arriving, so change outputs
+# and hot<->cold shuffles net out automatically.
+sub classify_exchange_tx {
+    my ($tx, $addr_set) = @_;
+
+    my ($in_nano, $out_nano) = (0, 0);
+    my (%external_senders, %external_receivers);
+
+    foreach my $input (@{ ref $tx->{inputs} eq 'ARRAY' ? $tx->{inputs} : [] }) {
+        my $address = $input->{address} // '';
+        my $value = ($input->{value} // 0) + 0;
+        if ($addr_set->{$address}) {
+            $out_nano += $value;
+        } elsif (length $address) {
+            $external_senders{$address} += $value;
+        }
+    }
+    foreach my $output (@{ ref $tx->{outputs} eq 'ARRAY' ? $tx->{outputs} : [] }) {
+        my $address = $output->{address} // '';
+        my $value = ($output->{value} // 0) + 0;
+        if ($addr_set->{$address}) {
+            $in_nano += $value;
+        } elsif (length $address) {
+            $external_receivers{$address} += $value;
+        }
+    }
+
+    my $net_nano = $in_nano - $out_nano;
+    my $direction = $net_nano >= 0 ? 'in' : 'out';
+    my $counterparties = $direction eq 'in' ? \%external_senders : \%external_receivers;
+    my ($counterparty) = sort { $counterparties->{$b} <=> $counterparties->{$a} } keys %$counterparties;
+
+    return {
+        direction    => $direction,
+        amount_erg   => abs($net_nano) / $NANOERG,
+        counterparty => $counterparty,
+    };
+}
+
+sub get_latest_price {
+    my ($dbh, $exchange) = @_;
+    my $sth = $dbh->prepare("SELECT price FROM price_data WHERE exchange = ? ORDER BY timestamp DESC LIMIT 1");
+    $sth->execute($exchange);
+    my ($price) = $sth->fetchrow_array();
+    $sth->finish();
+    return $price;
+}
+
+sub process_exchange_flows {
+    my ($dbh, $ua, $config, $exchange, $addresses, $price_usd) = @_;
+
+    print "Tracking on-chain flows for $exchange (" . scalar(@$addresses) . " address" . (@$addresses == 1 ? '' : 'es') . ")...\n";
+
+    my %addr_set = map { $_ => 1 } @$addresses;
+    my $base_url = $config->{ergo_explorer_url} || 'https://api.ergoplatform.com';
+    $base_url =~ s{/+$}{};
+
+    my $page_size   = 50;
+    my $max_pages   = 4;                      # up to 200 txs per address per run
+    my $lookback_ms = 48 * 3600 * 1000;       # backfill window on first run
+    my $now_ms      = int(time * 1000);
+    my $min_flow_erg = 0.01;                  # ignore fee-only / internal shuffles
+
+    my $known_sth = $dbh->prepare("SELECT 1 FROM exchange_flows WHERE exchange = ? AND tx_id = ?");
+    my $insert_sth = $dbh->prepare(qq{
+        INSERT IGNORE INTO exchange_flows
+        (exchange, tx_id, direction, amount_erg, amount_usd, price_usd, counterparty, block_height, tx_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?))
+    });
+    my $reserve_sth = $dbh->prepare("INSERT INTO exchange_reserves (exchange, address, balance_erg) VALUES (?, ?, ?)");
+
+    my @new_flows;
+    my %seen_tx;
+    my $total_reserve = 0;
+    my $reserve_ok = 0;
+
+    foreach my $address (@$addresses) {
+        # Reserve snapshot
+        my $balance = fetch_address_balance_erg($ua, $base_url, $address);
+        if (defined $balance) {
+            $reserve_sth->execute($exchange, $address, $balance);
+            $total_reserve += $balance;
+            $reserve_ok++;
+        }
+
+        # Recent transactions (explorer returns newest first); page until we reach ones we already have
+        my $offset = 0;
+        for my $page (1 .. $max_pages) {
+            my $txs = fetch_address_transactions($ua, $base_url, $address, $offset, $page_size);
+            last unless $txs && @$txs;
+
+            my $known_on_page = 0;
+            my $oldest_ms;
+
+            foreach my $tx (@$txs) {
+                my $tx_id = $tx->{id} or next;
+                next unless $tx->{inclusionHeight};              # confirmed only
+                my $ts_ms = ($tx->{timestamp} // 0) + 0;
+                $oldest_ms = $ts_ms if !defined $oldest_ms || $ts_ms < $oldest_ms;
+                next if $seen_tx{$tx_id}++;
+
+                $known_sth->execute($exchange, $tx_id);
+                my ($known) = $known_sth->fetchrow_array();
+                $known_sth->finish();
+                if ($known) { $known_on_page++; next; }
+
+                my $flow = classify_exchange_tx($tx, \%addr_set);
+                next if $flow->{amount_erg} < $min_flow_erg;
+
+                my $amount_usd = $price_usd ? $flow->{amount_erg} * $price_usd : undef;
+                my $inserted = $insert_sth->execute(
+                    $exchange, $tx_id, $flow->{direction}, $flow->{amount_erg}, $amount_usd, $price_usd,
+                    $flow->{counterparty}, $tx->{inclusionHeight}, int($ts_ms / 1000)
+                );
+                next unless $inserted && $inserted > 0;
+
+                push @new_flows, { %$flow, tx_id => $tx_id, tx_time_ms => $ts_ms };
+            }
+
+            last if $known_on_page > 0;
+            last if @$txs < $page_size;
+            last if defined $oldest_ms && $oldest_ms < $now_ms - $lookback_ms;
+            $offset += $page_size;
+        }
+    }
+    $known_sth->finish();
+    $insert_sth->finish();
+    $reserve_sth->finish();
+
+    my ($in_new, $out_new) = (0, 0);
+    foreach my $flow (@new_flows) {
+        if ($flow->{direction} eq 'in') { $in_new += $flow->{amount_erg} } else { $out_new += $flow->{amount_erg} }
+    }
+    printf "  Reserve: %s ERG across %d/%d addresses | new transfers: %d (in %.2f ERG, out %.2f ERG)\n",
+        $reserve_ok ? sprintf("%.2f", $total_reserve) : 'n/a', $reserve_ok, scalar(@$addresses),
+        scalar(@new_flows), $in_new, $out_new;
+
+    return \@new_flows;
+}
+
+sub analyze_flows {
+    my ($dbh, $config, $exchange, $new_flows, $price_usd) = @_;
+
+    my @alerts;
+    my $threshold = ($config->{flow_alert_threshold_erg} || 0) + 0;
+    return \@alerts if $threshold <= 0;
+
+    my $recent_cutoff_ms = (time - 15 * 60) * 1000;   # never alert on backfilled history
+
+    foreach my $flow (@$new_flows) {
+        next if $flow->{tx_time_ms} < $recent_cutoff_ms;
+        next if $flow->{amount_erg} < $threshold;
+
+        my $usd_note = $price_usd ? sprintf(" (~\$%.0f)", $flow->{amount_erg} * $price_usd) : '';
+        my $tx_link = "https://explorer.ergoplatform.com/en/transactions/$flow->{tx_id}";
+        my @fields = (
+            { name => 'Amount', value => sprintf("%.2f ERG%s", $flow->{amount_erg}, $usd_note), inline => 'true' },
+            { name => 'Transaction', value => "[" . substr($flow->{tx_id}, 0, 10) . "...]($tx_link)", inline => 'true' },
+        );
+
+        if ($flow->{direction} eq 'in') {
+            push @alerts, {
+                type     => 'LARGE_INFLOW',
+                severity => 'warning',
+                exchange => $exchange,
+                message  => sprintf("%s: %.0f ERG%s just arrived on the exchange on-chain. Deposits this size often precede selling - watch your bids.",
+                    $exchange, $flow->{amount_erg}, $usd_note),
+                fields   => \@fields,
+            };
+        } else {
+            push @alerts, {
+                type     => 'LARGE_OUTFLOW',
+                severity => 'info',
+                exchange => $exchange,
+                message  => sprintf("%s: %.0f ERG%s withdrawn from the exchange on-chain. Less sell-side supply sitting on the book.",
+                    $exchange, $flow->{amount_erg}, $usd_note),
+                fields   => \@fields,
+            };
+        }
+    }
+
+    # Net inflow over the last hour
+    my $sth = $dbh->prepare(qq{
+        SELECT
+            COALESCE(SUM(CASE WHEN direction = 'in'  THEN amount_erg ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN direction = 'out' THEN amount_erg ELSE 0 END), 0)
+        FROM exchange_flows
+        WHERE exchange = ? AND tx_time > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+    });
+    $sth->execute($exchange);
+    my ($in_1h, $out_1h) = $sth->fetchrow_array();
+    $sth->finish();
+
+    my $net_1h = ($in_1h || 0) - ($out_1h || 0);
+    if ($net_1h >= 2 * $threshold) {
+        my $usd_note = $price_usd ? sprintf(" (~\$%.0f)", $net_1h * $price_usd) : '';
+        push @alerts, {
+            type     => 'NET_INFLOW_HIGH',
+            severity => 'critical',
+            exchange => $exchange,
+            message  => sprintf("%s: net +%.0f ERG%s flowed onto the exchange in the last hour (in %.0f / out %.0f). Consider pulling or lowering bids and widening spread until it is absorbed.",
+                $exchange, $net_1h, $usd_note, $in_1h, $out_1h),
+            fields   => [
+                { name => 'Inflow 1h',  value => sprintf("%.2f ERG", $in_1h),   inline => 'true' },
+                { name => 'Outflow 1h', value => sprintf("%.2f ERG", $out_1h),  inline => 'true' },
+                { name => 'Net 1h',     value => sprintf("+%.2f ERG", $net_1h), inline => 'true' },
+            ],
+        };
+        add_recommendation($dbh, $exchange, 'FLOW', 'REDUCE_BIDS',
+            sprintf('Net on-chain inflow of %.0f ERG to %s in the last hour. Large deposits usually get sold; keep bids light or widen the spread until the book absorbs it.', $net_1h, $exchange),
+            8, 2);
+    }
+
+    return \@alerts;
+}
+
+# ============================================================
 # METRICS CALCULATION
 # ============================================================
 sub calculate_and_store_metrics {
     my ($dbh, $exchange) = @_;
 
-    # Calculate 1-hour and 24-hour metrics
+    # Calculate 1-hour and 24-hour metrics (trade windows use trade_time so re-fetched
+    # trades never count twice - the trades table has a unique (exchange, trade_id) key)
     my $sql = qq{
         INSERT INTO market_metrics
         (exchange, symbol, avg_spread_1h, avg_spread_24h, total_volume_1h, total_volume_24h,
@@ -680,13 +1131,13 @@ sub calculate_and_store_metrics {
             (SELECT AVG(spread_percent) FROM price_data
              WHERE exchange = ? AND timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)),
             (SELECT COALESCE(SUM(amount_usd), 0) FROM trades
-             WHERE exchange = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)),
+             WHERE exchange = ? AND trade_time > DATE_SUB(NOW(), INTERVAL 1 HOUR)),
             (SELECT COALESCE(SUM(amount_usd), 0) FROM trades
-             WHERE exchange = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)),
+             WHERE exchange = ? AND trade_time > DATE_SUB(NOW(), INTERVAL 24 HOUR)),
             (SELECT COUNT(*) FROM trades
-             WHERE exchange = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)),
+             WHERE exchange = ? AND trade_time > DATE_SUB(NOW(), INTERVAL 1 HOUR)),
             (SELECT COUNT(*) FROM trades
-             WHERE exchange = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)),
+             WHERE exchange = ? AND trade_time > DATE_SUB(NOW(), INTERVAL 24 HOUR)),
             (SELECT COALESCE(
                 ((MAX(high_24h) - MIN(low_24h)) / AVG(price)) * 100, 0)
              FROM price_data WHERE exchange = ? AND timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)),
@@ -704,16 +1155,18 @@ sub calculate_and_store_metrics {
 # ALERT SYSTEM
 # ============================================================
 sub check_alert_cooldown {
-    my ($dbh, $alert_type, $cooldown_minutes) = @_;
+    my ($dbh, $alert_type, $cooldown_minutes, $exchange) = @_;
 
+    # Cooldown is per alert type AND exchange, so a KuCoin alert never hides a MEXC one
     my $sql = qq{
         SELECT COUNT(*) FROM alerts_log
         WHERE alert_type = ?
+        AND COALESCE(exchange, '') = ?
         AND created_at > DATE_SUB(NOW(), INTERVAL ? MINUTE)
     };
 
     my $sth = $dbh->prepare($sql);
-    $sth->execute($alert_type, $cooldown_minutes);
+    $sth->execute($alert_type, $exchange // '', $cooldown_minutes);
     my ($count) = $sth->fetchrow_array();
     $sth->finish();
 
@@ -983,6 +1436,39 @@ sub analyze_and_recommend {
         }
     }
 
+    # Volume spike: last hour vs the 24h hourly average (needs >= 12h of de-duplicated trade history)
+    my $spike_mult = ($config->{volume_spike_threshold} || 0) + 0;
+    if ($spike_mult > 0) {
+        my $vsth = $dbh->prepare(qq{
+            SELECT
+                COALESCE(SUM(CASE WHEN trade_time > DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN amount_usd ELSE 0 END), 0),
+                COALESCE(SUM(amount_usd), 0),
+                TIMESTAMPDIFF(HOUR, MIN(trade_time), NOW())
+            FROM trades
+            WHERE exchange = ? AND trade_time > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        });
+        $vsth->execute($exchange);
+        my ($vol_1h, $vol_24h, $hours_covered) = $vsth->fetchrow_array();
+        $vsth->finish();
+
+        if (($hours_covered || 0) >= 12 && $vol_24h > 0) {
+            my $hourly_avg = $vol_24h / $hours_covered;
+            if ($hourly_avg > 0 && $vol_1h >= $spike_mult * $hourly_avg && $vol_1h >= 500) {
+                push @alerts, {
+                    type     => 'VOLUME_SPIKE',
+                    severity => 'warning',
+                    message  => sprintf("%s: 1h volume \$%.0f is %.1fx the 24h hourly average (\$%.0f). Consider widening spreads while it lasts.",
+                        $exchange, $vol_1h, $vol_1h / $hourly_avg, $hourly_avg),
+                    fields   => [
+                        { name => '1h Volume', value => sprintf("\$%.0f", $vol_1h), inline => 'true' },
+                        { name => 'Hourly Avg (24h)', value => sprintf("\$%.0f", $hourly_avg), inline => 'true' },
+                        { name => 'Multiple', value => sprintf("%.1fx", $vol_1h / $hourly_avg), inline => 'true' }
+                    ]
+                };
+            }
+        }
+    }
+
     return \@alerts;
 }
 
@@ -1056,6 +1542,12 @@ sub process_mexc {
         if ($user_orders) {
             store_user_orders($dbh, 'MEXC', $user_orders);
             store_user_depth($dbh, 'MEXC', $user_orders, $mid_price, \%depth_data);
+        }
+
+        my $transfers = fetch_mexc_transfers($ua);
+        if ($transfers) {
+            { local $dbh->{PrintError} = 0; eval { store_user_transfers($dbh, 'MEXC', $transfers) }; }
+            warn "Could not store MEXC transfers (has sql/add_flow_tables.sql been applied?): $@" if $@;
         }
     }
 
@@ -1152,6 +1644,12 @@ sub process_kucoin {
             store_user_orders($dbh, 'KUCOIN', $user_orders);
             store_user_depth($dbh, 'KUCOIN', $user_orders, $mid_price, \%depth_data);
         }
+
+        my $transfers = fetch_kucoin_transfers($ua);
+        if ($transfers) {
+            { local $dbh->{PrintError} = 0; eval { store_user_transfers($dbh, 'KUCOIN', $transfers) }; }
+            warn "Could not store KuCoin transfers (has sql/add_flow_tables.sql been applied?): $@" if $@;
+        }
     }
 
     # Calculate metrics
@@ -1172,6 +1670,17 @@ sub main {
     print "ERGO MM Monitor - " . strftime("%Y-%m-%d %H:%M:%S", localtime()) . "\n";
     print "=" x 60 . "\n";
 
+    # Skip this run if the previous one is still going (cron can fire every minute)
+    my $lock_fh;
+    if (open $lock_fh, '>>', $LOCK_FILE) {
+        unless (flock($lock_fh, LOCK_EX | LOCK_NB)) {
+            print "Previous monitor run is still in progress - skipping this run.\n";
+            return;
+        }
+    } else {
+        warn "Could not open lock file $LOCK_FILE: $! (continuing without lock)\n";
+    }
+
     # Load API keys from config file
     load_api_keys();
 
@@ -1190,13 +1699,44 @@ sub main {
     # Process MEXC
     if ($config->{mexc_enabled}) {
         my $mexc_alerts = process_mexc($dbh, $ua, $config);
-        push @all_alerts, @$mexc_alerts if $mexc_alerts;
+        if ($mexc_alerts) {
+            $_->{exchange} //= 'MEXC' for @$mexc_alerts;
+            push @all_alerts, @$mexc_alerts;
+        }
     }
 
     # Process KuCoin
     if ($config->{kucoin_enabled}) {
         my $kucoin_alerts = process_kucoin($dbh, $ua, $config);
-        push @all_alerts, @$kucoin_alerts if $kucoin_alerts;
+        if ($kucoin_alerts) {
+            $_->{exchange} //= 'KUCOIN' for @$kucoin_alerts;
+            push @all_alerts, @$kucoin_alerts;
+        }
+    }
+
+    # On-chain ERG flows in/out of each exchange. Runs after the market data is
+    # stored so a slow explorer can never delay price/depth collection.
+    if (!defined $config->{flow_tracking_enabled} || $config->{flow_tracking_enabled}) {
+        my $explorer_ua = create_http_client(($config->{ergo_explorer_timeout} || 20) + 0);
+        foreach my $exchange ('MEXC', 'KUCOIN') {
+            next unless $config->{lc($exchange) . '_enabled'};
+            my @addresses = parse_address_list($config->{lc($exchange) . '_erg_addresses'});
+            unless (@addresses) {
+                print "No $exchange wallet addresses configured - skipping on-chain flow tracking (set them in Settings).\n";
+                next;
+            }
+            my $price = get_latest_price($dbh, $exchange);
+            my $new_flows = do {
+                local $dbh->{PrintError} = 0;   # a missing table is reported below with a hint, no need for DBI's own line
+                eval { process_exchange_flows($dbh, $explorer_ua, $config, $exchange, \@addresses, $price) };
+            };
+            if ($@) {
+                warn "Flow tracking for $exchange failed (has sql/add_flow_tables.sql been applied?): $@";
+                next;
+            }
+            my $flow_alerts = analyze_flows($dbh, $config, $exchange, $new_flows, $price);
+            push @all_alerts, @$flow_alerts;
+        }
     }
 
     # Send alerts
@@ -1204,7 +1744,7 @@ sub main {
     my $webhook_url = $config->{discord_webhook};
 
     foreach my $alert (@all_alerts) {
-        if (check_alert_cooldown($dbh, $alert->{type}, $cooldown)) {
+        if (check_alert_cooldown($dbh, $alert->{type}, $cooldown, $alert->{exchange})) {
             my $sent = 0;
             if ($webhook_url) {
                 $sent = send_discord_alert(
@@ -1212,13 +1752,14 @@ sub main {
                     "ERGO MM Alert: " . $alert->{type},
                     $alert->{message},
                     $alert->{severity},
-                    $alert->{fields}
+                    $alert->{fields},
+                    $alert->{exchange}
                 );
             }
-            log_alert($dbh, $alert->{type}, $alert->{severity}, undef, $alert->{message}, $alert->{fields}, $sent);
+            log_alert($dbh, $alert->{type}, $alert->{severity}, $alert->{exchange}, $alert->{message}, $alert->{fields}, $sent);
             print "ALERT [$alert->{severity}]: $alert->{message}\n";
         } else {
-            print "SKIPPED (cooldown): $alert->{type}\n";
+            print "SKIPPED (cooldown): $alert->{type}" . ($alert->{exchange} ? " ($alert->{exchange})" : '') . "\n";
         }
     }
 
@@ -1235,7 +1776,7 @@ sub main {
     $dbh->disconnect();
 }
 
-# Run the main function
-main();
+# Run the main function (skipped when the file is require'd by a test harness)
+main() unless caller;
 
 1;

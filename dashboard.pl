@@ -258,7 +258,7 @@ sub get_trade_history {
 
     my $sth = $dbh->prepare(qq{
         SELECT
-            DATE_FORMAT(recorded_at, '%Y-%m-%d %H:00') as time_bucket,
+            DATE_FORMAT(trade_time, '%Y-%m-%d %H:00') as time_bucket,
             COUNT(*) as trade_count,
             SUM(amount_usd) as total_volume,
             SUM(CASE WHEN side = 'buy' THEN amount_usd ELSE 0 END) as buy_volume,
@@ -266,7 +266,7 @@ sub get_trade_history {
             AVG(price) as avg_price
         FROM trades
         WHERE exchange = ?
-          AND recorded_at > DATE_SUB(NOW(), INTERVAL ? HOUR)
+          AND trade_time > DATE_SUB(NOW(), INTERVAL ? HOUR)
         GROUP BY time_bucket
         ORDER BY time_bucket
         LIMIT 50
@@ -375,12 +375,177 @@ sub get_trade_summary {
             AVG(price) as avg_price
         FROM trades
         WHERE exchange = ?
-          AND recorded_at > DATE_SUB(NOW(), INTERVAL ? HOUR)
+          AND trade_time > DATE_SUB(NOW(), INTERVAL ? HOUR)
     });
     $sth->execute($exchange, $hours);
     my $row = $sth->fetchrow_hashref();
     $sth->finish();
     return $row;
+}
+
+sub get_data_freshness {
+    my ($dbh) = @_;
+    my $sth = $dbh->prepare("SELECT MAX(timestamp), TIMESTAMPDIFF(SECOND, MAX(timestamp), NOW()) FROM price_data");
+    $sth->execute();
+    my ($last_update, $age) = $sth->fetchrow_array();
+    $sth->finish();
+    return { last_update => $last_update, age_seconds => $age };
+}
+
+# ------------------------------------------------------------
+# On-chain exchange flows (tables from sql/add_flow_tables.sql)
+# ------------------------------------------------------------
+sub parse_address_list {
+    my ($text) = @_;
+    return () unless defined $text;
+    my %seen;
+    my @addresses;
+    foreach my $candidate (split /[\s,;]+/, $text) {
+        next unless length $candidate;
+        next unless $candidate =~ /^[1-9A-HJ-NP-Za-km-z]{20,120}$/;   # base58 only
+        push @addresses, $candidate unless $seen{$candidate}++;
+    }
+    return @addresses;
+}
+
+sub get_flow_summary {
+    my ($dbh) = @_;
+    my $sth = $dbh->prepare(qq{
+        SELECT
+            exchange,
+            SUM(CASE WHEN direction = 'in'  AND tx_time > DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN amount_erg ELSE 0 END) AS in_1h,
+            SUM(CASE WHEN direction = 'out' AND tx_time > DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN amount_erg ELSE 0 END) AS out_1h,
+            SUM(CASE WHEN direction = 'in'  AND tx_time > DATE_SUB(NOW(), INTERVAL 6 HOUR) THEN amount_erg ELSE 0 END) AS in_6h,
+            SUM(CASE WHEN direction = 'out' AND tx_time > DATE_SUB(NOW(), INTERVAL 6 HOUR) THEN amount_erg ELSE 0 END) AS out_6h,
+            SUM(CASE WHEN direction = 'in'  THEN amount_erg ELSE 0 END) AS in_24h,
+            SUM(CASE WHEN direction = 'out' THEN amount_erg ELSE 0 END) AS out_24h,
+            COUNT(*) AS tx_24h,
+            MAX(tx_time) AS last_tx
+        FROM exchange_flows
+        WHERE tx_time > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        GROUP BY exchange
+    });
+    $sth->execute();
+    my %results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        $results{$row->{exchange}} = $row;
+    }
+    $sth->finish();
+    return \%results;
+}
+
+sub get_flow_reserves {
+    my ($dbh) = @_;
+    my $sth = $dbh->prepare(qq{
+        SELECT r.exchange, r.address, r.balance_erg, r.timestamp
+        FROM exchange_reserves r
+        INNER JOIN (
+            SELECT exchange, address, MAX(timestamp) AS max_time
+            FROM exchange_reserves
+            WHERE timestamp > DATE_SUB(NOW(), INTERVAL 1 DAY)
+            GROUP BY exchange, address
+        ) x ON r.exchange = x.exchange AND r.address = x.address AND r.timestamp = x.max_time
+        ORDER BY r.exchange, r.balance_erg DESC
+    });
+    $sth->execute();
+    my %results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        my $ex = $results{$row->{exchange}} ||= { total_erg => 0, addresses => [], updated => undef };
+        $ex->{total_erg} += $row->{balance_erg};
+        push @{$ex->{addresses}}, $row;
+        $ex->{updated} = $row->{timestamp} if !defined $ex->{updated} || $row->{timestamp} gt $ex->{updated};
+    }
+    $sth->finish();
+    return \%results;
+}
+
+sub get_recent_flows {
+    my ($dbh, $limit, $hours) = @_;
+    $limit ||= 100;
+    $hours ||= 48;
+    my $sth = $dbh->prepare(qq{
+        SELECT exchange, tx_id, direction, amount_erg, amount_usd, counterparty, block_height, tx_time
+        FROM exchange_flows
+        WHERE tx_time > DATE_SUB(NOW(), INTERVAL ? HOUR)
+        ORDER BY tx_time DESC
+        LIMIT ?
+    });
+    $sth->execute($hours, $limit);
+    my @results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        push @results, $row;
+    }
+    $sth->finish();
+    return \@results;
+}
+
+sub get_flow_history {
+    my ($dbh, $hours) = @_;
+    $hours ||= 48;
+    my $sth = $dbh->prepare(qq{
+        SELECT
+            exchange,
+            DATE_FORMAT(tx_time, '%Y-%m-%d %H:00') AS time_bucket,
+            SUM(CASE WHEN direction = 'in'  THEN amount_erg ELSE 0 END) AS in_erg,
+            SUM(CASE WHEN direction = 'out' THEN amount_erg ELSE 0 END) AS out_erg
+        FROM exchange_flows
+        WHERE tx_time > DATE_SUB(NOW(), INTERVAL ? HOUR)
+        GROUP BY exchange, time_bucket
+        ORDER BY time_bucket
+    });
+    $sth->execute($hours);
+    my @results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        push @results, $row;
+    }
+    $sth->finish();
+    return \@results;
+}
+
+sub get_reserve_history {
+    my ($dbh, $hours) = @_;
+    $hours ||= 48;
+    # Average each address within a 30-minute bucket, then sum the addresses per exchange
+    my $sth = $dbh->prepare(qq{
+        SELECT exchange, time_bucket, SUM(avg_balance) AS balance_erg
+        FROM (
+            SELECT
+                exchange,
+                address,
+                CONCAT(DATE_FORMAT(timestamp, '%Y-%m-%d %H:'), LPAD(FLOOR(MINUTE(timestamp) / 30) * 30, 2, '0')) AS time_bucket,
+                AVG(balance_erg) AS avg_balance
+            FROM exchange_reserves
+            WHERE timestamp > DATE_SUB(NOW(), INTERVAL ? HOUR)
+            GROUP BY exchange, address, time_bucket
+        ) per_address
+        GROUP BY exchange, time_bucket
+        ORDER BY time_bucket
+    });
+    $sth->execute($hours);
+    my @results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        push @results, $row;
+    }
+    $sth->finish();
+    return \@results;
+}
+
+sub get_user_transfers {
+    my ($dbh, $limit) = @_;
+    $limit ||= 50;
+    my $sth = $dbh->prepare(qq{
+        SELECT exchange, direction, amount_erg, fee_erg, status, address, tx_id, tx_time
+        FROM user_transfers
+        ORDER BY tx_time DESC
+        LIMIT ?
+    });
+    $sth->execute($limit);
+    my @results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        push @results, $row;
+    }
+    $sth->finish();
+    return \@results;
 }
 
 # ============================================================
@@ -871,6 +1036,62 @@ sub html_header {
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: var(--bg-secondary); }
         ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
+
+        /* Live / stale data indicator + auto-refresh countdown */
+        .status-indicator.stale { background: rgba(239, 68, 68, 0.15); color: var(--accent-red); border: 1px solid rgba(239, 68, 68, 0.4); }
+        .status-indicator.stale .status-dot { background: var(--accent-red); }
+        .refresh-timer { font-size: 12px; color: var(--text-muted); cursor: pointer; user-select: none; white-space: nowrap; }
+        .refresh-timer:hover { color: var(--text-secondary); }
+        .refresh-timer.paused { color: var(--accent-orange); }
+
+        /* Cross-exchange strip */
+        .xchg-strip { grid-column: span 12; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+        .xchg-box { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 10px; padding: 12px 16px; }
+        .xchg-label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; }
+        .xchg-value { font-size: 18px; font-weight: 600; margin-top: 4px; }
+        .xchg-value.positive { color: var(--accent-green); }
+        .xchg-value.warning { color: var(--accent-orange); }
+        .xchg-value.negative { color: var(--accent-red); }
+        .xchg-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+
+        /* On-chain flow tables */
+        .flow-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+        .flow-exchange { background: var(--bg-tertiary); border-radius: 10px; padding: 14px; }
+        .flow-exchange-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 12px; }
+        .flow-reserve { font-size: 12px; color: var(--text-secondary); text-align: right; line-height: 1.3; }
+        .flow-reserve strong { color: var(--text-primary); font-size: 15px; }
+        .flow-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .flow-table th, .flow-table td { padding: 8px 10px; text-align: right; border-bottom: 1px solid var(--border-color); white-space: nowrap; }
+        .flow-table th { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; }
+        .flow-table th:first-child, .flow-table td:first-child { text-align: left; }
+        .flow-table tr:last-child td { border-bottom: none; }
+        .flow-table.wide td { white-space: normal; }
+        .flow-in { color: var(--accent-orange); }       /* ERG arriving on the exchange = potential sell pressure */
+        .flow-out { color: var(--accent-cyan); }        /* ERG leaving the exchange = supply off the book */
+        .flow-net-pos { color: var(--accent-orange); font-weight: 600; }
+        .flow-net-neg { color: var(--accent-cyan); font-weight: 600; }
+        .flow-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+        .flow-badge.in { background: rgba(245, 158, 11, 0.15); color: var(--accent-orange); }
+        .flow-badge.out { background: rgba(0, 212, 170, 0.15); color: var(--accent-cyan); }
+        .flow-badge.deposit { background: rgba(34, 197, 94, 0.15); color: var(--accent-green); }
+        .flow-badge.withdrawal { background: rgba(139, 92, 246, 0.15); color: var(--accent-purple); }
+        .flow-note { font-size: 12px; color: var(--text-muted); margin-top: 10px; line-height: 1.5; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+        .tx-link { color: var(--accent-blue); text-decoration: none; }
+        .tx-link:hover { text-decoration: underline; }
+        .addr-list { list-style: none; margin-top: 10px; font-size: 11px; color: var(--text-muted); border-top: 1px solid var(--border-color); padding-top: 8px; }
+        .addr-list li { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+        .setup-hint { background: rgba(59, 130, 246, 0.08); border: 1px dashed rgba(59, 130, 246, 0.4); border-radius: 8px; padding: 12px 14px; font-size: 13px; color: var(--text-secondary); line-height: 1.5; }
+        .setup-hint a { color: var(--accent-cyan); }
+        .setup-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--bg-secondary); padding: 1px 6px; border-radius: 4px; }
+        .table-scroll { overflow-x: auto; }
+        .inventory-bar { height: 8px; border-radius: 4px; background: var(--accent-blue); overflow: hidden; margin-top: 6px; display: flex; }
+        .inventory-bar span { display: block; height: 100%; background: var(--accent-cyan); }
+        textarea.setting-input { min-height: 76px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; resize: vertical; }
+
+        \@media (max-width: 900px) {
+            .flow-grid, .xchg-strip { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
@@ -924,17 +1145,32 @@ sub render_dashboard {
     my $recommendations = get_active_recommendations($dbh);
     my $alerts = get_recent_alerts($dbh, 20);
     my $config = get_config($dbh);
+    my $freshness = get_data_freshness($dbh);
 
-    # Get chart data for each exchange (6h window for fast loading)
+    # Get chart data for each exchange (6h window for fast loading) - only the tabs that draw them
     my %chart_data;
-    foreach my $exchange ('MEXC', 'KUCOIN') {
-        $chart_data{$exchange} = {
-            price_history => get_price_history($dbh, $exchange, 6),
-            depth_history => get_depth_history($dbh, $exchange, 6),
-            trade_history => get_trade_history($dbh, $exchange, 6),
-            trade_summary => get_trade_summary($dbh, $exchange, 6),
-        };
+    if ($tab eq 'overview' || $tab eq 'charts') {
+        foreach my $exchange ('MEXC', 'KUCOIN') {
+            $chart_data{$exchange} = {
+                price_history => get_price_history($dbh, $exchange, 6),
+                depth_history => get_depth_history($dbh, $exchange, 6),
+                trade_history => get_trade_history($dbh, $exchange, 6),
+                trade_summary => get_trade_summary($dbh, $exchange, 6),
+            };
+        }
     }
+
+    # Live / stale badge: the monitor is expected every minute; 5 minutes without data is a problem
+    my $age = $freshness->{age_seconds};
+    my ($status_class, $status_text);
+    if (!defined $age) {
+        ($status_class, $status_text) = ('stale', 'No data yet');
+    } elsif ($age > 300) {
+        ($status_class, $status_text) = ('stale', 'STALE - last data ' . format_age($age) . ' ago');
+    } else {
+        ($status_class, $status_text) = ('', 'Live - updated ' . format_age($age) . ' ago');
+    }
+    my $auto_refresh = $tab eq 'settings' ? 0 : 60;   # never reload under someone editing settings
 
     print "Content-type: text/html\n\n";
     print html_header('ERGO MM Dashboard');
@@ -949,10 +1185,11 @@ sub render_dashboard {
                 </div>
             </div>
             <div class="header-actions">
-                <div class="status-indicator">
+                <div class="status-indicator $status_class" title="Newest price sample: } . ($freshness->{last_update} || 'none') . qq{">
                     <span class="status-dot online"></span>
-                    <span>Monitoring Active</span>
+                    <span>$status_text</span>
                 </div>
+                } . ($auto_refresh ? qq{<span id="refresh-timer" class="refresh-timer" title="Click to pause/resume auto-refresh">Refresh in ${auto_refresh}s</span>} : '') . qq{
                 <a href="?tab=settings" class="btn btn-secondary">Settings</a>
                 <a href="?logout=1" class="btn btn-secondary">Logout</a>
             </div>
@@ -960,6 +1197,7 @@ sub render_dashboard {
 
         <div class="tabs">
             <a href="?tab=overview" class="tab } . ($tab eq 'overview' ? 'active' : '') . qq{">Overview</a>
+            <a href="?tab=flows" class="tab } . ($tab eq 'flows' ? 'active' : '') . qq{">Flows</a>
             <a href="?tab=charts" class="tab } . ($tab eq 'charts' ? 'active' : '') . qq{">Charts</a>
             <a href="?tab=alerts" class="tab } . ($tab eq 'alerts' ? 'active' : '') . qq{">Alerts</a>
             <a href="?tab=settings" class="tab } . ($tab eq 'settings' ? 'active' : '') . qq{">Settings</a>
@@ -967,7 +1205,9 @@ sub render_dashboard {
     };
 
     if ($tab eq 'overview') {
-        render_overview_tab($dbh, $prices, $depth, $metrics, $recommendations, $alerts, \%chart_data);
+        render_overview_tab($dbh, $prices, $depth, $metrics, $recommendations, $alerts, \%chart_data, $config);
+    } elsif ($tab eq 'flows') {
+        render_flows_tab($dbh, $config);
     } elsif ($tab eq 'charts') {
         render_charts_tab($dbh, \%chart_data, $config);
     } elsif ($tab eq 'alerts') {
@@ -977,11 +1217,50 @@ sub render_dashboard {
     }
 
     print qq{</div>};
+
+    if ($auto_refresh) {
+        print qq{
+    <script>
+    (function() {
+        var seconds = $auto_refresh;
+        var el = document.getElementById('refresh-timer');
+        if (!el) return;
+        var paused = false;
+        try { paused = localStorage.getItem('ergo_mm_autorefresh') === 'off'; } catch (e) {}
+        var deadline = Date.now() + seconds * 1000;
+        function draw(remaining) {
+            el.textContent = paused ? 'Auto-refresh paused (click to resume)' : ('Refresh in ' + remaining + 's');
+            el.className = 'refresh-timer' + (paused ? ' paused' : '');
+        }
+        function tick() {
+            if (paused) { draw(seconds); return; }
+            var remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+            if (remaining <= 0) {
+                if (!document.hidden) { location.reload(); }   // background tabs reload when they come back
+                return;
+            }
+            draw(remaining);
+        }
+        el.addEventListener('click', function() {
+            paused = !paused;
+            try { localStorage.setItem('ergo_mm_autorefresh', paused ? 'off' : 'on'); } catch (e) {}
+            deadline = Date.now() + seconds * 1000;
+            tick();
+        });
+        setInterval(tick, 1000);
+        document.addEventListener('visibilitychange', tick);
+        tick();
+    })();
+    </script>
+        };
+    }
+
     print html_footer();
 }
 
 sub render_overview_tab {
-    my ($dbh, $prices, $depth, $metrics, $recommendations, $alerts, $chart_data) = @_;
+    my ($dbh, $prices, $depth, $metrics, $recommendations, $alerts, $chart_data, $config) = @_;
+    $config ||= {};
 
     # Fetch user balance and depth data
     my $user_balances = get_latest_user_balances($dbh);
@@ -989,6 +1268,9 @@ sub render_overview_tab {
     my $user_orders = get_user_open_orders($dbh);
 
     print qq{<div class="dashboard-grid">};
+
+    # KuCoin vs MEXC price gap - are the books crossed against you?
+    render_cross_exchange_strip($prices);
 
     # Exchange Cards
     foreach my $exchange_data (@$prices) {
@@ -1157,6 +1439,22 @@ sub render_overview_tab {
                         </div>
                     </div>
                 };
+
+                # Inventory skew: a market maker usually wants to sit near 50/50 ERG/USDT by value
+                my $erg_value = ($user_bal->{erg_total} || 0) * ($exchange_data->{price} || 0);
+                my $total_value = $user_bal->{total_value_usd} || 0;
+                if ($total_value > 0) {
+                    my $erg_pct = $erg_value / $total_value * 100;
+                    $erg_pct = 100 if $erg_pct > 100;
+                    my $skew_style = abs($erg_pct - 50) > 25 ? 'color: var(--accent-orange); font-weight: 600;' : 'color: var(--text-primary);';
+                    print qq{
+                    <div class="balance-detail" style="margin: -8px 0 14px;">
+                        Inventory split: <span style="$skew_style">} . sprintf("%.0f", $erg_pct) . qq{% ERG / } . sprintf("%.0f", 100 - $erg_pct) . qq{% USDT</span>
+                        <span style="color: var(--text-muted);">(50/50 = neutral; &gt;75% one side = skewed)</span>
+                        <div class="inventory-bar" title="Cyan = ERG, blue = USDT"><span style="width: } . sprintf("%.0f", $erg_pct) . qq{%;"></span></div>
+                    </div>
+                    };
+                }
             }
 
             # Display user depth share table
@@ -1239,15 +1537,15 @@ sub render_overview_tab {
 
                 <div class="stats-row">
                     <div class="stat-box">
-                        <div class="stat-label">24h Trades</div>
+                        <div class="stat-label">6h Trades</div>
                         <div class="stat-value">} . ($trade_summary->{trade_count} || 0) . qq{</div>
                     </div>
                     <div class="stat-box">
-                        <div class="stat-label">Buy Vol</div>
+                        <div class="stat-label">6h Buy Vol</div>
                         <div class="stat-value bid-value">\$} . format_number($buy_vol) . qq{</div>
                     </div>
                     <div class="stat-box">
-                        <div class="stat-label">Sell Vol</div>
+                        <div class="stat-label">6h Sell Vol (} . sprintf("%.0f", 100 - $buy_ratio) . qq{%)</div>
                         <div class="stat-value ask-value">\$} . format_number($sell_vol) . qq{</div>
                     </div>
                 </div>
@@ -1388,6 +1686,9 @@ sub render_overview_tab {
         };
     }
 
+    # ERG moving on/off the exchanges (on-chain)
+    render_flow_summary_card($dbh, $config, 0);
+
     # Recommendations Card
     print qq{
         <div class="card full-width">
@@ -1405,7 +1706,8 @@ sub render_overview_tab {
                                  $rec->{priority} >= 5 ? 'priority-medium' : 'priority-low';
             my $icon = $rec->{action} eq 'PULL_LIQUIDITY' ? '⚠️' :
                        $rec->{action} eq 'ADD_LIQUIDITY' ? '💰' :
-                       $rec->{action} eq 'TIGHTEN_SPREAD' ? '📉' : '💡';
+                       $rec->{action} eq 'TIGHTEN_SPREAD' ? '📉' :
+                       $rec->{action} eq 'REDUCE_BIDS' ? '📥' : '💡';
 
             print qq{
                 <div class="recommendation-item $priority_class">
@@ -1483,6 +1785,366 @@ sub render_overview_tab {
             </div>
         </div>
     };
+
+    print qq{</div>};
+}
+
+sub render_cross_exchange_strip {
+    my ($prices) = @_;
+
+    my %by_exchange = map { $_->{exchange} => $_ } @$prices;
+    my ($m, $k) = ($by_exchange{MEXC}, $by_exchange{KUCOIN});
+    return unless $m && $k && $m->{price} && $k->{price};
+
+    my $mid_m = ($m->{bid_price} && $m->{ask_price}) ? ($m->{bid_price} + $m->{ask_price}) / 2 : $m->{price};
+    my $mid_k = ($k->{bid_price} && $k->{ask_price}) ? ($k->{bid_price} + $k->{ask_price}) / 2 : $k->{price};
+    my $avg = ($mid_m + $mid_k) / 2;
+    my $gap_pct = $avg ? ($mid_m - $mid_k) / $avg * 100 : 0;
+    my $gap_class = abs($gap_pct) >= 1 ? 'negative' : abs($gap_pct) >= 0.5 ? 'warning' : 'positive';
+    my $gap_note = $gap_pct > 0.05 ? 'MEXC trades above KuCoin' : $gap_pct < -0.05 ? 'KuCoin trades above MEXC' : 'Venues aligned';
+
+    # Can someone buy on one book and sell on the other at a profit? If yes, your quotes are being arbed.
+    my $arb_buy_k = ($k->{ask_price} && $m->{bid_price}) ? ($m->{bid_price} - $k->{ask_price}) / $k->{ask_price} * 100 : -99;
+    my $arb_buy_m = ($m->{ask_price} && $k->{bid_price}) ? ($k->{bid_price} - $m->{ask_price}) / $m->{ask_price} * 100 : -99;
+    my ($best_arb, $arb_route) = $arb_buy_k >= $arb_buy_m
+        ? ($arb_buy_k, 'buy KuCoin ask, sell MEXC bid')
+        : ($arb_buy_m, 'buy MEXC ask, sell KuCoin bid');
+    my $arb_class = $best_arb > 0.3 ? 'negative' : $best_arb > 0 ? 'warning' : 'positive';
+    my $arb_value = $best_arb > 0 ? sprintf("CROSSED +%.2f%%", $best_arb) : sprintf("No (%.2f%%)", $best_arb);
+    my $arb_note = $best_arb > 0 ? "Profitable: $arb_route" : "Best route ($arb_route) loses money";
+
+    print qq{
+        <div class="xchg-strip">
+            <div class="xchg-box">
+                <div class="xchg-label">MEXC mid</div>
+                <div class="xchg-value">\$} . sprintf("%.4f", $mid_m) . qq{</div>
+                <div class="xchg-sub">bid } . sprintf("%.4f", $m->{bid_price} || 0) . qq{ / ask } . sprintf("%.4f", $m->{ask_price} || 0) . qq{ · spread } . sprintf("%.2f", $m->{spread_percent} || 0) . qq{%</div>
+            </div>
+            <div class="xchg-box">
+                <div class="xchg-label">KuCoin mid</div>
+                <div class="xchg-value">\$} . sprintf("%.4f", $mid_k) . qq{</div>
+                <div class="xchg-sub">bid } . sprintf("%.4f", $k->{bid_price} || 0) . qq{ / ask } . sprintf("%.4f", $k->{ask_price} || 0) . qq{ · spread } . sprintf("%.2f", $k->{spread_percent} || 0) . qq{%</div>
+            </div>
+            <div class="xchg-box">
+                <div class="xchg-label">Price gap (MEXC vs KuCoin)</div>
+                <div class="xchg-value $gap_class">} . sprintf("%+.2f%%", $gap_pct) . qq{</div>
+                <div class="xchg-sub">$gap_note · \$} . sprintf("%.4f", abs($mid_m - $mid_k)) . qq{ apart</div>
+            </div>
+            <div class="xchg-box">
+                <div class="xchg-label">Books crossed?</div>
+                <div class="xchg-value $arb_class">$arb_value</div>
+                <div class="xchg-sub">$arb_note</div>
+            </div>
+        </div>
+    };
+}
+
+sub render_flow_exchange_box {
+    my ($exchange, $summary, $reserve, $config, $show_addresses) = @_;
+
+    my $exchange_lower = lc($exchange);
+    my $display = $exchange eq 'KUCOIN' ? 'KuCoin' : $exchange;
+    my @addresses = parse_address_list($config->{"${exchange_lower}_erg_addresses"}{value});
+
+    print qq{
+        <div class="flow-exchange">
+            <div class="flow-exchange-header">
+                <div class="exchange-header" style="margin-bottom: 0;">
+                    <div class="exchange-logo $exchange_lower" style="width: 32px; height: 32px; font-size: 10px;">$exchange</div>
+                    <div class="exchange-name" style="font-size: 16px;">$display</div>
+                </div>
+    };
+
+    unless (@addresses) {
+        my $how = $exchange eq 'MEXC'
+            ? "MEXC's wallet is not publicly catalogued. Open one of your own MEXC ERG withdrawals on the explorer: the sending address is MEXC's hot wallet. Paste it into "
+            : "Add them in ";
+        print qq{
+            </div>
+            <div class="setup-hint">No $display wallet addresses configured, so on-chain flows are not tracked yet. $how<a href="?tab=settings">Settings &rarr; On-chain Flow Tracking</a>.</div>
+        </div>
+        };
+        return;
+    }
+
+    my $reserve_html;
+    if ($reserve && $reserve->{total_erg}) {
+        $reserve_html = qq{<div class="flow-reserve"><strong>} . format_erg($reserve->{total_erg}) . qq{ ERG</strong> in tracked wallets<br>as of $reserve->{updated}</div>};
+    } else {
+        $reserve_html = qq{<div class="flow-reserve">Reserve: waiting for the first explorer poll</div>};
+    }
+
+    print qq{
+                $reserve_html
+            </div>
+            <table class="flow-table">
+                <thead><tr><th>Window</th><th>In (deposits)</th><th>Out (withdrawals)</th><th>Net</th></tr></thead>
+                <tbody>
+    };
+
+    foreach my $window ('1h', '6h', '24h') {
+        my $in  = $summary ? ($summary->{"in_$window"}  || 0) : 0;
+        my $out = $summary ? ($summary->{"out_$window"} || 0) : 0;
+        my $net = $in - $out;
+        my $net_class = $net > 0 ? 'flow-net-pos' : $net < 0 ? 'flow-net-neg' : '';
+        print qq{
+                    <tr>
+                        <td>$window</td>
+                        <td class="flow-in">} . format_erg($in) . qq{</td>
+                        <td class="flow-out">} . format_erg($out) . qq{</td>
+                        <td class="$net_class">} . format_signed_erg($net) . qq{</td>
+                    </tr>
+        };
+    }
+
+    my $tx_count = $summary ? ($summary->{tx_24h} || 0) : 0;
+    my $last_tx = ($summary && $summary->{last_tx}) ? $summary->{last_tx} : 'none in the last 24h';
+
+    print qq{
+                </tbody>
+            </table>
+            <div class="flow-note">$tx_count transfer} . ($tx_count == 1 ? '' : 's') . qq{ in 24h &middot; last: $last_tx</div>
+    };
+
+    if ($show_addresses) {
+        my %balance_by_addr = map { $_->{address} => $_->{balance_erg} } @{ ($reserve && $reserve->{addresses}) || [] };
+        print qq{<ul class="addr-list">};
+        foreach my $address (@addresses) {
+            my $balance = defined $balance_by_addr{$address} ? format_erg($balance_by_addr{$address}) . ' ERG' : 'no balance fetched yet';
+            print qq{<li><a class="tx-link mono" href="} . explorer_addr_url($address) . qq{" target="_blank" rel="noopener">} . short_hash($address, 12, 8) . qq{</a><span>$balance</span></li>};
+        }
+        print qq{</ul>};
+    }
+
+    print qq{</div>};
+}
+
+sub render_flow_summary_card {
+    my ($dbh, $config, $show_addresses) = @_;
+
+    # Quiet DBI's PrintError here: a missing table just means the migration has not been applied yet
+    local $dbh->{PrintError} = 0;
+    my $summary  = eval { get_flow_summary($dbh) };
+    my $tables_ok = defined $summary;
+    my $reserves = $tables_ok ? (eval { get_flow_reserves($dbh) } || {}) : {};
+    my $tracking_on = !defined $config->{flow_tracking_enabled} || ($config->{flow_tracking_enabled}{value} // '1') ne '0';
+
+    print qq{
+        <div class="card full-width">
+            <div class="card-header">
+                <div class="card-title">ERG On-chain Exchange Flows} . ($show_addresses ? '' : ' (24h)') . qq{</div>
+                } . ($show_addresses ? '' : qq{<a href="?tab=flows" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;">Full history &rarr;</a>}) . qq{
+            </div>
+            <div class="card-body">
+    };
+
+    if (!$tables_ok) {
+        print qq{<div class="setup-hint">Flow tables are not installed yet. Run <code>mysql -u root -p ergo_mm &lt; sql/add_flow_tables.sql</code> on the server, then the monitor will start recording ERG moving in and out of the exchanges.</div>};
+    } else {
+        print qq{<div class="setup-hint" style="margin-bottom: 14px;">On-chain flow tracking is disabled in <a href="?tab=settings">Settings</a>; the numbers below will not update.</div>} unless $tracking_on;
+        print qq{<div class="flow-grid">};
+        foreach my $exchange ('MEXC', 'KUCOIN') {
+            render_flow_exchange_box($exchange, $summary->{$exchange}, $reserves->{$exchange}, $config, $show_addresses);
+        }
+        print qq{</div>
+            <div class="flow-note">
+                <span class="flow-in">In</span> = ERG deposited into the exchange's wallets (deposits are usually sold soon after, so treat a jump as incoming sell pressure).
+                <span class="flow-out">Out</span> = ERG withdrawn from the exchange (supply leaving the book).
+                Net &gt; 0 means the exchange is stacking sell-side inventory; net &lt; 0 means it is draining. Polled every minute from the Ergo explorer.
+            </div>};
+    }
+
+    print qq{</div></div>};
+}
+
+sub render_flows_tab {
+    my ($dbh, $config) = @_;
+
+    print qq{<div class="dashboard-grid">};
+
+    render_flow_summary_card($dbh, $config, 1);
+
+    local $dbh->{PrintError} = 0;   # tables may not exist yet; the card above already explains that
+    my $flow_history    = eval { get_flow_history($dbh, 48) } || [];
+    my $reserve_history = eval { get_reserve_history($dbh, 48) } || [];
+    my $recent_flows    = eval { get_recent_flows($dbh, 100, 48) } || [];
+    my $user_transfers  = eval { get_user_transfers($dbh, 50) } || [];
+
+    # Charts: net flow per hour + reserve balance
+    my (%net_by_bucket, %reserve_by_bucket);
+    foreach my $row (@$flow_history) {
+        $net_by_bucket{$row->{time_bucket}}{$row->{exchange}} = ($row->{in_erg} || 0) - ($row->{out_erg} || 0);
+    }
+    foreach my $row (@$reserve_history) {
+        $reserve_by_bucket{$row->{time_bucket}}{$row->{exchange}} = $row->{balance_erg} + 0;
+    }
+    my @flow_labels = sort keys %net_by_bucket;
+    my @reserve_labels = sort keys %reserve_by_bucket;
+    my @mexc_net   = map { $net_by_bucket{$_}{MEXC}   // 0 } @flow_labels;
+    my @kucoin_net = map { $net_by_bucket{$_}{KUCOIN} // 0 } @flow_labels;
+    my @mexc_res   = map { $reserve_by_bucket{$_}{MEXC}   } @reserve_labels;     # undef -> null (gap)
+    my @kucoin_res = map { $reserve_by_bucket{$_}{KUCOIN} } @reserve_labels;
+
+    my $flow_labels_json    = encode_json(\@flow_labels);
+    my $reserve_labels_json = encode_json(\@reserve_labels);
+    my $mexc_net_json       = encode_json(\@mexc_net);
+    my $kucoin_net_json     = encode_json(\@kucoin_net);
+    my $mexc_res_json       = encode_json(\@mexc_res);
+    my $kucoin_res_json     = encode_json(\@kucoin_res);
+
+    print qq{
+        <div class="card half-width">
+            <div class="card-header"><div class="card-title">Net Flow per Hour (48h)</div></div>
+            <div class="card-body"><div class="chart-container tall"><canvas id="flowNetChart"></canvas></div></div>
+        </div>
+        <div class="card half-width">
+            <div class="card-header"><div class="card-title">ERG Held in Tracked Exchange Wallets (48h)</div></div>
+            <div class="card-body"><div class="chart-container tall"><canvas id="reserveChart"></canvas></div></div>
+        </div>
+
+        <script>
+        (function() {
+            const tickCb = function(value) {
+                const label = this.getLabelForValue(value);
+                if (label && label.length > 5) {
+                    const parts = label.split(' ');
+                    return parts.length > 1 ? parts[1] : label.slice(-5);
+                }
+                return label;
+            };
+            const base = {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { labels: { color: '#9aa0a6', boxWidth: 12, font: { size: 11 } } },
+                    tooltip: { mode: 'index', intersect: false, backgroundColor: 'rgba(30, 34, 42, 0.95)', titleColor: '#e8eaed', bodyColor: '#9aa0a6', borderColor: '#374151', borderWidth: 1, padding: 10 }
+                },
+                scales: {
+                    x: { grid: { color: '#374151' }, ticks: { color: '#9aa0a6', maxTicksLimit: 12, maxRotation: 45, callback: tickCb } },
+                    y: { grid: { color: '#374151' }, ticks: { color: '#9aa0a6' } }
+                }
+            };
+            new Chart(document.getElementById('flowNetChart'), {
+                type: 'bar',
+                data: {
+                    labels: $flow_labels_json,
+                    datasets: [
+                        { label: 'MEXC net (ERG)', data: $mexc_net_json, backgroundColor: 'rgba(22, 82, 240, 0.75)' },
+                        { label: 'KuCoin net (ERG)', data: $kucoin_net_json, backgroundColor: 'rgba(36, 174, 143, 0.75)' }
+                    ]
+                },
+                options: {
+                    ...base,
+                    plugins: { ...base.plugins, title: { display: true, text: 'Positive = ERG arriving on the exchange, negative = leaving', color: '#e8eaed' } }
+                }
+            });
+            new Chart(document.getElementById('reserveChart'), {
+                type: 'line',
+                data: {
+                    labels: $reserve_labels_json,
+                    datasets: [
+                        { label: 'MEXC (ERG)', data: $mexc_res_json, borderColor: '#1652f0', backgroundColor: 'rgba(22, 82, 240, 0.1)', fill: true, tension: 0.3, pointRadius: 0, spanGaps: true },
+                        { label: 'KuCoin (ERG)', data: $kucoin_res_json, borderColor: '#24ae8f', backgroundColor: 'rgba(36, 174, 143, 0.1)', fill: true, tension: 0.3, pointRadius: 0, spanGaps: true }
+                    ]
+                },
+                options: {
+                    ...base,
+                    plugins: { ...base.plugins, title: { display: true, text: 'Confirmed balance of the tracked wallets', color: '#e8eaed' } },
+                    scales: { ...base.scales, y: { ...base.scales.y, ticks: { ...base.scales.y.ticks, callback: v => (v / 1000).toFixed(1) + 'k' } } }
+                }
+            });
+        })();
+        </script>
+    };
+
+    # Recent on-chain transfers
+    print qq{
+        <div class="card full-width">
+            <div class="card-header">
+                <div class="card-title">Recent On-chain Transfers (48h)</div>
+                <span class="card-badge">} . scalar(@$recent_flows) . qq{ shown</span>
+            </div>
+            <div class="card-body">
+    };
+
+    if (@$recent_flows) {
+        print qq{
+                <div class="table-scroll">
+                <table class="flow-table wide">
+                    <thead><tr><th>Time</th><th>Exchange</th><th>Direction</th><th>Amount</th><th>&asymp; USD</th><th>Counterparty</th><th>Transaction</th></tr></thead>
+                    <tbody>
+        };
+        foreach my $flow (@$recent_flows) {
+            my $dir = $flow->{direction} eq 'in' ? 'in' : 'out';
+            my $dir_label = $dir eq 'in' ? 'IN (deposit)' : 'OUT (withdrawal)';
+            my $tx_id = escapeHTML($flow->{tx_id} || '');
+            my $counterparty = $flow->{counterparty} ? escapeHTML($flow->{counterparty}) : '';
+            my $counterparty_html = $counterparty
+                ? qq{<a class="tx-link mono" href="} . explorer_addr_url($counterparty) . qq{" target="_blank" rel="noopener">} . short_hash($counterparty, 8, 6) . qq{</a>}
+                : '<span class="mono" style="color: var(--text-muted);">-</span>';
+            my $usd = defined $flow->{amount_usd} ? '$' . commify(sprintf("%.0f", $flow->{amount_usd})) : '-';
+            print qq{
+                        <tr>
+                            <td style="text-align: left;">$flow->{tx_time}</td>
+                            <td style="text-align: left;">} . ($flow->{exchange} eq 'KUCOIN' ? 'KuCoin' : $flow->{exchange}) . qq{</td>
+                            <td style="text-align: left;"><span class="flow-badge $dir">$dir_label</span></td>
+                            <td class="flow-$dir">} . format_erg($flow->{amount_erg}) . qq{ ERG</td>
+                            <td>$usd</td>
+                            <td>$counterparty_html</td>
+                            <td><a class="tx-link mono" href="} . explorer_tx_url($tx_id) . qq{" target="_blank" rel="noopener">} . short_hash($tx_id, 10, 6) . qq{</a></td>
+                        </tr>
+            };
+        }
+        print qq{</tbody></table></div>};
+    } else {
+        print qq{<div class="empty-state"><div class="empty-state-icon">&#9878;</div><p>No on-chain transfers recorded in the last 48 hours. Once wallet addresses are configured and the monitor has polled the explorer, deposits and withdrawals will appear here within a minute of confirming.</p></div>};
+    }
+    print qq{</div></div>};
+
+    # Your own deposits / withdrawals from the exchange account APIs
+    print qq{
+        <div class="card full-width">
+            <div class="card-header">
+                <div class="card-title">Your ERG Deposits &amp; Withdrawals (exchange account)</div>
+                <span class="card-badge">} . scalar(@$user_transfers) . qq{ shown</span>
+            </div>
+            <div class="card-body">
+    };
+
+    if (@$user_transfers) {
+        print qq{
+                <div class="table-scroll">
+                <table class="flow-table wide">
+                    <thead><tr><th>Time</th><th>Exchange</th><th>Type</th><th>Amount</th><th>Fee</th><th>Status</th><th>Address</th><th>Transaction</th></tr></thead>
+                    <tbody>
+        };
+        foreach my $t (@$user_transfers) {
+            my $type = $t->{direction} eq 'deposit' ? 'deposit' : 'withdrawal';
+            my $status = escapeHTML($t->{status} || '');
+            my $address = $t->{address} ? escapeHTML($t->{address}) : '';
+            my $tx_id = $t->{tx_id} ? escapeHTML($t->{tx_id}) : '';
+            my $tx_html = $tx_id
+                ? qq{<a class="tx-link mono" href="} . explorer_tx_url($tx_id) . qq{" target="_blank" rel="noopener">} . short_hash($tx_id, 10, 6) . qq{</a>}
+                : '<span style="color: var(--text-muted);">-</span>';
+            print qq{
+                        <tr>
+                            <td style="text-align: left;">} . ($t->{tx_time} || '-') . qq{</td>
+                            <td style="text-align: left;">} . ($t->{exchange} eq 'KUCOIN' ? 'KuCoin' : $t->{exchange}) . qq{</td>
+                            <td style="text-align: left;"><span class="flow-badge $type">$type</span></td>
+                            <td>} . format_erg($t->{amount_erg}) . qq{ ERG</td>
+                            <td>} . sprintf("%.4f", $t->{fee_erg} || 0) . qq{</td>
+                            <td>$status</td>
+                            <td><span class="mono" title="$address">} . short_hash($address, 8, 6) . qq{</span></td>
+                            <td>$tx_html</td>
+                        </tr>
+            };
+        }
+        print qq{</tbody></table></div>};
+    } else {
+        print qq{<div class="empty-state"><p>No account deposits or withdrawals recorded. This list fills in from the MEXC/KuCoin account APIs when <code>api_keys.conf</code> is configured with read-only keys.</p></div>};
+    }
+    print qq{</div></div>};
 
     print qq{</div>};
 }
@@ -1900,9 +2562,48 @@ sub render_settings_tab {
                                            value="} . ($config->{price_change_warning}{value} || '5.0') . qq{">
                                 </div>
                                 <div class="setting-item">
+                                    <label class="setting-label">Price Change Critical (%)</label>
+                                    <input type="number" step="0.1" name="price_change_critical" class="setting-input"
+                                           value="} . ($config->{price_change_critical}{value} || '10.0') . qq{">
+                                    <div class="setting-description">24h move that raises PRICE_CHANGE_HIGH and a REDUCE_EXPOSURE recommendation</div>
+                                </div>
+                                <div class="setting-item">
                                     <label class="setting-label">Liquidity Pull Threshold (%)</label>
                                     <input type="number" step="0.1" name="liquidity_pull_threshold" class="setting-input"
                                            value="} . ($config->{liquidity_pull_threshold}{value} || '15.0') . qq{">
+                                </div>
+                            </div>
+
+                            <div class="setting-group">
+                                <h3>On-chain Flow Tracking</h3>
+                                <div class="setting-item">
+                                    <label class="setting-label">Track ERG flows in/out of exchanges</label>
+                                    <select name="flow_tracking_enabled" class="setting-input">
+                                        <option value="1" } . (($config->{flow_tracking_enabled}{value} // '1') ne '0' ? 'selected' : '') . qq{>Enabled</option>
+                                        <option value="0" } . (($config->{flow_tracking_enabled}{value} // '1') eq '0' ? 'selected' : '') . qq{>Disabled</option>
+                                    </select>
+                                </div>
+                                <div class="setting-item">
+                                    <label class="setting-label">KuCoin ERG Wallet Addresses</label>
+                                    <textarea name="kucoin_erg_addresses" class="setting-input" placeholder="One per line or comma-separated">} . escapeHTML($config->{kucoin_erg_addresses}{value} // '') . qq{</textarea>
+                                    <div class="setting-description">Pre-filled with the community-tracked KuCoin wallets. The Flows tab shows each address's live balance, so a wrong one is easy to spot and remove.</div>
+                                </div>
+                                <div class="setting-item">
+                                    <label class="setting-label">MEXC ERG Wallet Addresses</label>
+                                    <textarea name="mexc_erg_addresses" class="setting-input" placeholder="One per line or comma-separated">} . escapeHTML($config->{mexc_erg_addresses}{value} // '') . qq{</textarea>
+                                    <div class="setting-description">Open one of your MEXC ERG withdrawals on explorer.ergoplatform.com: the sending address is MEXC's hot wallet.</div>
+                                </div>
+                                <div class="setting-item">
+                                    <label class="setting-label">Large Transfer Alert (ERG)</label>
+                                    <input type="number" step="1" min="0" name="flow_alert_threshold_erg" class="setting-input"
+                                           value="} . ($config->{flow_alert_threshold_erg}{value} // '5000') . qq{">
+                                    <div class="setting-description">A single deposit/withdrawal this size alerts (LARGE_INFLOW / LARGE_OUTFLOW). Net 1h inflow of 2x this raises a critical NET_INFLOW_HIGH alert and a REDUCE_BIDS recommendation. 0 disables.</div>
+                                </div>
+                                <div class="setting-item">
+                                    <label class="setting-label">Ergo Explorer API URL</label>
+                                    <input type="text" name="ergo_explorer_url" class="setting-input"
+                                           value="} . escapeHTML($config->{ergo_explorer_url}{value} // 'https://api.ergoplatform.com') . qq{">
+                                    <div class="setting-description">Point this at your own explorer backend if the public one is slow or rate-limited.</div>
                                 </div>
                             </div>
 
@@ -1927,6 +2628,48 @@ sub render_settings_tab {
         </div>
     };
 }
+
+sub commify {
+    my ($num) = @_;
+    my $text = reverse "$num";
+    $text =~ s/(\d\d\d)(?=\d)(?!\d*\.)/$1,/g;
+    return scalar reverse $text;
+}
+
+sub format_erg {
+    my ($num) = @_;
+    $num = 0 unless defined $num;
+    return '0' if $num == 0;
+    return commify(sprintf("%.0f", $num)) if abs($num) >= 100;
+    return sprintf("%.2f", $num);
+}
+
+sub format_signed_erg {
+    my ($num) = @_;
+    $num = 0 unless defined $num;
+    my $sign = $num > 0 ? '+' : $num < 0 ? '-' : '';
+    return $sign . format_erg(abs($num));
+}
+
+sub format_age {
+    my ($seconds) = @_;
+    return 'n/a' unless defined $seconds;
+    return sprintf("%ds", $seconds) if $seconds < 60;
+    return sprintf("%dm", $seconds / 60) if $seconds < 3600;
+    return sprintf("%.1fh", $seconds / 3600);
+}
+
+sub short_hash {
+    my ($text, $head, $tail) = @_;
+    return '' unless defined $text;
+    $head ||= 8;
+    $tail ||= 6;
+    return $text if length($text) <= $head + $tail + 3;
+    return substr($text, 0, $head) . '&hellip;' . substr($text, -$tail);
+}
+
+sub explorer_tx_url   { return "https://explorer.ergoplatform.com/en/transactions/$_[0]"; }
+sub explorer_addr_url { return "https://explorer.ergoplatform.com/en/addresses/$_[0]"; }
 
 sub format_number {
     my ($num) = @_;
@@ -1985,6 +2728,8 @@ sub main {
             price_change_warning price_change_critical liquidity_pull_threshold
             volume_spike_threshold
             kucoin_enabled mexc_enabled monitoring_enabled
+            flow_tracking_enabled kucoin_erg_addresses mexc_erg_addresses
+            flow_alert_threshold_erg ergo_explorer_url
         );
 
         foreach my $setting (@settings) {

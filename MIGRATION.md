@@ -110,6 +110,12 @@ exit
 ```bash
 mysql -u root -p ergo_mm < /opt/ergo_mm/sql/schema.sql
 mysql -u root -p ergo_mm < /opt/ergo_mm/sql/add_user_tables.sql
+mysql -u root -p ergo_mm < /opt/ergo_mm/sql/add_flow_tables.sql
+```
+
+**Upgrading an existing database** (adds the on-chain flow tables and de-duplicates the trades table; safe to re-run):
+```bash
+mysql -u root -p ergo_mm < /opt/ergo_mm/sql/add_flow_tables.sql
 ```
 
 **OR migrate data from old server (see Step 8).**
@@ -244,8 +250,8 @@ sudo certbot --nginx -d mm.ergoplatform.com
 # Edit crontab
 sudo crontab -e
 
-# Add this line (runs every 5 minutes):
-*/5 * * * * /usr/bin/perl /var/www/ergo_mm/cgi-bin/monitor.pl >> /var/log/ergo_mm/monitor.log 2>&1
+# Add this line (runs every minute; monitor.pl takes a lock so runs never overlap):
+* * * * * /usr/bin/perl /var/www/ergo_mm/cgi-bin/monitor.pl >> /var/log/ergo_mm/monitor.log 2>&1
 ```
 
 Create log file:
@@ -366,3 +372,4 @@ sudo cpan Install::Module::Name
 | `https://mm.ergoplatform.com/cgi-bin/dashboard.pl` | Main dashboard |
 | `https://mm.ergoplatform.com/cgi-bin/api.pl?endpoint=health` | Health check |
 | `https://mm.ergoplatform.com/cgi-bin/api.pl?endpoint=overview&api_key=PASSWORD` | Full API |
+| `https://mm.ergoplatform.com/cgi-bin/api.pl?endpoint=flows&api_key=PASSWORD` | On-chain ERG flows in/out of exchanges |
