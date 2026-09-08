@@ -927,26 +927,34 @@ sub parse_address_list {
     return @addresses;
 }
 
+# Returns the decoded JSON (undef on failure). In list context also returns the
+# HTTP status, so callers can tell a rejected address (400) from an explorer hiccup.
 sub explorer_get {
     my ($ua, $base_url, $path) = @_;
     my $response = $ua->get("$base_url$path", 'Accept' => 'application/json');
+    my $status = $response->code;
     unless ($response->is_success) {
-        warn "Explorer request failed ($path): " . $response->status_line . "\n";
-        return undef;
+        warn "Explorer request failed ($path): " . $response->status_line . "\n" unless $status == 400;
+        return wantarray ? (undef, $status) : undef;
     }
     my $data = eval { decode_json($response->decoded_content) };
     if ($@) {
         warn "Explorer returned invalid JSON ($path): $@";
-        return undef;
+        return wantarray ? (undef, $status) : undef;
     }
-    return $data;
+    return wantarray ? ($data, $status) : $data;
 }
 
 sub fetch_address_balance_erg {
     my ($ua, $base_url, $address) = @_;
-    my $data = explorer_get($ua, $base_url, "/api/v1/addresses/$address/balance/confirmed");
-    return undef unless $data && ref $data eq 'HASH' && defined $data->{nanoErgs};
-    return $data->{nanoErgs} / $NANOERG;
+    my ($data, $status) = explorer_get($ua, $base_url, "/api/v1/addresses/$address/balance/confirmed");
+    my $balance = ($data && ref $data eq 'HASH' && defined $data->{nanoErgs}) ? $data->{nanoErgs} / $NANOERG : undef;
+    return wantarray ? ($balance, $status) : $balance;
+}
+
+sub fetch_transaction {
+    my ($ua, $base_url, $tx_id) = @_;
+    return explorer_get($ua, $base_url, "/api/v1/transactions/$tx_id");
 }
 
 sub fetch_address_transactions {
@@ -1036,11 +1044,14 @@ sub process_exchange_flows {
 
     foreach my $address (@$addresses) {
         # Reserve snapshot
-        my $balance = fetch_address_balance_erg($ua, $base_url, $address);
+        my ($balance, $status) = fetch_address_balance_erg($ua, $base_url, $address);
         if (defined $balance) {
             $reserve_sth->execute($exchange, $address, $balance);
             $total_reserve += $balance;
             $reserve_ok++;
+        } elsif (($status // 0) == 400) {
+            warn "  $exchange address $address was rejected by the explorer (HTTP 400): not a valid Ergo address. Remove it in Settings > On-chain Flow Tracking.\n";
+            next;   # its transactions endpoint would fail the same way
         }
 
         # Recent transactions (explorer returns newest first); page until we reach ones we already have
@@ -1096,6 +1107,66 @@ sub process_exchange_flows {
         scalar(@new_flows), $in_new, $out_new;
 
     return \@new_flows;
+}
+
+# Hot-wallet discovery: the address that funded one of your own withdrawals is
+# the exchange's sending wallet. Each withdrawal tx is looked up once; the
+# addresses found are stored as hints that Settings offers for tracking.
+sub detect_exchange_wallets {
+    my ($dbh, $ua, $config, $exchange) = @_;
+
+    my $base_url = $config->{ergo_explorer_url} || 'https://api.ergoplatform.com';
+    $base_url =~ s{/+$}{};
+
+    my $sth = $dbh->prepare(qq{
+        SELECT t.tx_id
+        FROM user_transfers t
+        WHERE t.exchange = ? AND t.currency = 'ERG' AND t.direction = 'withdrawal'
+          AND t.tx_id IS NOT NULL AND t.tx_id <> ''
+          AND NOT EXISTS (SELECT 1 FROM exchange_wallet_hints h WHERE h.exchange = t.exchange AND h.tx_id = t.tx_id)
+        ORDER BY t.tx_time DESC
+        LIMIT 3
+    });
+    $sth->execute($exchange);
+    my @tx_ids = map { $_->[0] } @{ $sth->fetchall_arrayref() };
+    $sth->finish();
+    return unless @tx_ids;
+
+    my $ins = $dbh->prepare("INSERT IGNORE INTO exchange_wallet_hints (exchange, tx_id, address) VALUES (?, ?, ?)");
+    my %found;
+    foreach my $tx_id (@tx_ids) {
+        unless ($tx_id =~ /^[0-9a-fA-F]{64}$/) {          # not an Ergo tx hash: mark as checked, move on
+            $ins->execute($exchange, $tx_id, undef);
+            next;
+        }
+        my ($tx, $status) = fetch_transaction($ua, $base_url, $tx_id);
+        unless ($tx && ref $tx eq 'HASH') {
+            # 404/400 will never resolve -> mark checked; anything else is retried next run
+            $ins->execute($exchange, $tx_id, undef) if ($status // 0) == 404 || ($status // 0) == 400;
+            next;
+        }
+        my %senders;
+        foreach my $input (@{ ref $tx->{inputs} eq 'ARRAY' ? $tx->{inputs} : [] }) {
+            my $address = $input->{address} // '';
+            $senders{$address} = 1 if $address =~ /^[1-9A-HJ-NP-Za-km-z]{20,120}$/;
+        }
+        if (%senders) {
+            foreach my $address (keys %senders) {
+                $ins->execute($exchange, $tx_id, $address);
+                $found{$address}++;
+            }
+        } else {
+            $ins->execute($exchange, $tx_id, undef);
+        }
+    }
+    $ins->finish();
+
+    if (%found) {
+        my %configured = map { $_ => 1 } parse_address_list($config->{lc($exchange) . '_erg_addresses'});
+        my @new = grep { !$configured{$_} } sort keys %found;
+        print "  $exchange sent your withdrawals from: " . join(', ', sort keys %found) . "\n";
+        print "  -> not tracked yet; add in Settings > On-chain Flow Tracking: " . join(', ', @new) . "\n" if @new;
+    }
 }
 
 sub analyze_flows {
@@ -1783,6 +1854,14 @@ sub main {
         my $explorer_ua = create_http_client(($config->{ergo_explorer_timeout} || 20) + 0);
         foreach my $exchange ('MEXC', 'KUCOIN') {
             next unless $config->{lc($exchange) . '_enabled'};
+
+            # Learn the exchange's hot wallet from your own withdrawals (needs api_keys.conf)
+            {
+                local $dbh->{PrintError} = 0;
+                eval { detect_exchange_wallets($dbh, $explorer_ua, $config, $exchange) };
+                warn "Wallet discovery for $exchange failed (has sql/add_flow_tables.sql been applied?): $@" if $@;
+            }
+
             my @addresses = parse_address_list($config->{lc($exchange) . '_erg_addresses'});
             unless (@addresses) {
                 print "No $exchange wallet addresses configured - skipping on-chain flow tracking (set them in Settings).\n";

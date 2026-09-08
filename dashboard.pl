@@ -530,6 +530,26 @@ sub get_reserve_history {
     return \@results;
 }
 
+sub get_wallet_hints {
+    my ($dbh) = @_;
+    # Addresses that sent your own withdrawals = the exchange's hot wallet(s)
+    my $sth = $dbh->prepare(qq{
+        SELECT exchange, address, COUNT(DISTINCT tx_id) AS withdrawals, MAX(checked_at) AS last_seen
+        FROM exchange_wallet_hints
+        WHERE address IS NOT NULL
+        GROUP BY exchange, address
+        ORDER BY withdrawals DESC, last_seen DESC
+    });
+    $sth->execute();
+    my %results;
+    while (my $row = $sth->fetchrow_hashref()) {
+        next unless $row->{address} =~ /^[1-9A-HJ-NP-Za-km-z]{20,120}$/;   # only ever print base58
+        push @{$results{$row->{exchange}}}, $row;
+    }
+    $sth->finish();
+    return \%results;
+}
+
 sub get_user_transfer_summary {
     my ($dbh) = @_;
     # Deposits/withdrawals of the MM account per exchange and asset over 1d / 7d / 30d.
@@ -1249,7 +1269,7 @@ sub render_dashboard {
     } elsif ($tab eq 'alerts') {
         render_alerts_tab($alerts);
     } elsif ($tab eq 'settings') {
-        render_settings_tab($config, $saved);
+        render_settings_tab($config, $saved, $dbh);
     }
 
     print qq{</div>};
@@ -1876,7 +1896,8 @@ sub render_cross_exchange_strip {
 }
 
 sub render_flow_exchange_box {
-    my ($exchange, $summary, $reserve, $config, $show_addresses) = @_;
+    my ($exchange, $summary, $reserve, $config, $show_addresses, $hints) = @_;
+    $hints ||= {};
 
     my $exchange_lower = lc($exchange);
     my $display = $exchange eq 'KUCOIN' ? 'KuCoin' : $exchange;
@@ -1892,9 +1913,12 @@ sub render_flow_exchange_box {
     };
 
     unless (@addresses) {
-        my $how = $exchange eq 'MEXC'
-            ? "MEXC's wallet is not publicly catalogued. Open one of your own MEXC ERG withdrawals on the explorer: the sending address is MEXC's hot wallet. Paste it into "
-            : "Add them in ";
+        my @found = map { $_->{address} } @{ $hints->{$exchange} || [] };
+        my $how = @found
+            ? "Your withdrawals were sent from <span class=\"mono\">" . join('</span>, <span class="mono">', @found) . "</span>: that is the hot wallet. Add it with one click in "
+            : $exchange eq 'MEXC'
+                ? "MEXC's wallet is not publicly catalogued; once api_keys.conf works the monitor finds it from your own withdrawals and offers it in "
+                : "Add them in ";
         print qq{
             </div>
             <div class="setup-hint">No $display wallet addresses configured, so on-chain flows are not tracked yet. $how<a href="?tab=settings">Settings &rarr; On-chain Flow Tracking</a>.</div>
@@ -1963,6 +1987,7 @@ sub render_flow_summary_card {
     my $summary  = eval { get_flow_summary($dbh) };
     my $tables_ok = defined $summary;
     my $reserves = $tables_ok ? (eval { get_flow_reserves($dbh) } || {}) : {};
+    my $hints    = $tables_ok ? (eval { get_wallet_hints($dbh) } || {}) : {};
     my $tracking_on = !defined $config->{flow_tracking_enabled} || ($config->{flow_tracking_enabled}{value} // '1') ne '0';
 
     print qq{
@@ -1980,7 +2005,7 @@ sub render_flow_summary_card {
         print qq{<div class="setup-hint" style="margin-bottom: 14px;">On-chain flow tracking is disabled in <a href="?tab=settings">Settings</a>; the numbers below will not update.</div>} unless $tracking_on;
         print qq{<div class="flow-grid">};
         foreach my $exchange ('MEXC', 'KUCOIN') {
-            render_flow_exchange_box($exchange, $summary->{$exchange}, $reserves->{$exchange}, $config, $show_addresses);
+            render_flow_exchange_box($exchange, $summary->{$exchange}, $reserves->{$exchange}, $config, $show_addresses, $hints);
         }
         print qq{</div>
             <div class="flow-note">
@@ -2592,8 +2617,34 @@ sub render_alerts_tab {
     print qq{</div></div></div>};
 }
 
+sub render_wallet_hints_html {
+    my ($exchange, $hints, $textarea_name, $configured) = @_;
+    my @rows = @{ $hints->{$exchange} || [] };
+    return '' unless @rows;
+
+    my %configured = map { $_ => 1 } @$configured;
+    my $html = qq{<div class="setting-description" style="margin-top: 8px; color: var(--text-secondary);">Seen sending your withdrawals (the exchange's hot wallet):</div><ul class="addr-list" style="border-top: none; padding-top: 2px; margin-top: 2px;">};
+    foreach my $h (@rows) {
+        my $address = $h->{address};
+        my $n = $h->{withdrawals} || 0;
+        my $action = $configured{$address}
+            ? qq{<span style="color: var(--accent-green);">tracked</span>}
+            : qq{<a href="#" class="tx-link" onclick="return ergoAddAddress('$textarea_name', '$address');">add</a>};
+        $html .= qq{<li><span class="mono">$address</span><span>$n withdrawal} . ($n == 1 ? '' : 's') . qq{ &middot; $action</span></li>};
+    }
+    return $html . '</ul>';
+}
+
 sub render_settings_tab {
-    my ($config, $saved) = @_;
+    my ($config, $saved, $dbh) = @_;
+
+    my $hints = {};
+    if ($dbh) {
+        local $dbh->{PrintError} = 0;
+        $hints = eval { get_wallet_hints($dbh) } || {};
+    }
+    my @kucoin_configured = parse_address_list($config->{kucoin_erg_addresses}{value});
+    my @mexc_configured   = parse_address_list($config->{mexc_erg_addresses}{value});
 
     my $saved_msg = '';
     if ($saved) {
@@ -2712,12 +2763,14 @@ sub render_settings_tab {
                                 <div class="setting-item">
                                     <label class="setting-label">KuCoin ERG Wallet Addresses</label>
                                     <textarea name="kucoin_erg_addresses" class="setting-input" placeholder="One per line or comma-separated">} . escapeHTML($config->{kucoin_erg_addresses}{value} // '') . qq{</textarea>
-                                    <div class="setting-description">Pre-filled with the community-tracked KuCoin wallets. The Flows tab shows each address's live balance, so a wrong one is easy to spot and remove.</div>
+                                    <div class="setting-description">Pre-filled with one known KuCoin wallet. The Flows tab shows each address's live balance; the monitor log reports any address the explorer rejects.</div>
+                                    } . render_wallet_hints_html('KUCOIN', $hints, 'kucoin_erg_addresses', \@kucoin_configured) . qq{
                                 </div>
                                 <div class="setting-item">
                                     <label class="setting-label">MEXC ERG Wallet Addresses</label>
                                     <textarea name="mexc_erg_addresses" class="setting-input" placeholder="One per line or comma-separated">} . escapeHTML($config->{mexc_erg_addresses}{value} // '') . qq{</textarea>
-                                    <div class="setting-description">Open one of your MEXC ERG withdrawals on explorer.ergoplatform.com: the sending address is MEXC's hot wallet.</div>
+                                    <div class="setting-description">MEXC's wallet is not publicly catalogued. Once api_keys.conf is working, the monitor looks up your own MEXC withdrawals and lists the sending address here; or open one on explorer.ergoplatform.com yourself.</div>
+                                    } . render_wallet_hints_html('MEXC', $hints, 'mexc_erg_addresses', \@mexc_configured) . qq{
                                 </div>
                                 <div class="setting-item">
                                     <label class="setting-label">Large Transfer Alert (ERG)</label>
@@ -2752,6 +2805,17 @@ sub render_settings_tab {
                 </div>
             </div>
         </div>
+        <script>
+        function ergoAddAddress(fieldName, address) {
+            var field = document.getElementsByName(fieldName)[0];
+            if (!field) return false;
+            if (field.value.indexOf(address) === -1) {
+                field.value = (field.value.trim() ? field.value.trim() + "\\n" : '') + address;
+            }
+            field.focus();
+            return false;
+        }
+        </script>
     };
 }
 
